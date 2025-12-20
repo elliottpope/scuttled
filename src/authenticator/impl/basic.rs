@@ -37,7 +37,7 @@ impl<U: UserStore + 'static> Authenticator for BasicAuthenticator<U> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::implementations::SQLiteUserStore;
+    use crate::userstore::r#impl::SQLiteUserStore;
     use tempfile::TempDir;
 
     #[async_std::test]

@@ -1,8 +1,12 @@
 //! Scuttled IMAP server binary
 
-use scuttled::implementations::*;
+use scuttled::authenticator::r#impl::BasicAuthenticator;
+use scuttled::index::r#impl::InMemoryIndex;
+use scuttled::mailstore::r#impl::FilesystemMailStore;
+use scuttled::queue::r#impl::ChannelQueue;
+use scuttled::userstore::r#impl::SQLiteUserStore;
 use scuttled::server::ImapServer;
-use scuttled::{MailStore, UserStore};
+use scuttled::{Index, MailStore, UserStore};
 use std::path::PathBuf;
 
 #[async_std::main]
@@ -11,17 +15,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let data_dir = PathBuf::from("./data");
     let mail_dir = data_dir.join("mail");
-    let index_dir = data_dir.join("index");
     let db_path = data_dir.join("users.db");
 
     std::fs::create_dir_all(&data_dir)?;
     std::fs::create_dir_all(&mail_dir)?;
-    std::fs::create_dir_all(&index_dir)?;
 
     log::info!("Initializing IMAP server components...");
 
     let mail_store = FilesystemMailStore::new(&mail_dir).await?;
-    let index = DefaultIndex::new(&index_dir)?;
+    let index = InMemoryIndex::new();
     let user_store1 = SQLiteUserStore::new(&db_path).await?;
     let user_store2 = SQLiteUserStore::new(&db_path).await?;
 
@@ -31,12 +33,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log::info!("Creating default INBOX...");
-    if let Err(e) = mail_store.create_mailbox("INBOX").await {
+    if let Err(e) = index.create_mailbox("test", "INBOX").await {
         log::warn!("Failed to create INBOX (may already exist): {}", e);
     }
 
     let authenticator = BasicAuthenticator::new(user_store1);
-    let queue = InMemoryQueue::new();
+    let queue = ChannelQueue::new();
 
     let server = ImapServer::new(mail_store, index, authenticator, user_store2, queue);
 

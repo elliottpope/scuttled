@@ -5,30 +5,41 @@ An async IMAP server implementation in Rust using `async_std`.
 ## Features
 
 - **Async/Await**: Built on `async_std` for efficient async I/O
+- **Channel-Based Architecture**: Single-writer pattern using channels eliminates lock contention
+- **Path-Based Storage**: Clean separation between metadata (Index) and content (MailStore)
 - **Modular Design**: Clean trait-based abstractions for all major components
-- **Full-Featured**: Includes implementations for mail storage, indexing, authentication, and task queuing
+- **Graceful Shutdown**: All components support clean shutdown
 
 ## Architecture
+
+### Core Principles
+
+**Channel-Based Writer Loops**: All mutable state is managed through single-writer loops that receive commands via channels. This eliminates lock contention and guarantees write ordering.
+
+**Separation of Concerns**:
+- **Index** tracks all metadata and returns file paths
+- **MailStore** is a simple key-value store (path -> content)
+- No shared state between components
 
 ### Library Abstractions
 
 The library provides trait abstractions for the following components:
 
-- **MailStore**: Interface for storing and retrieving raw email messages
-- **Index**: Interface for indexing and searching email contents
+- **MailStore**: Path-based interface for storing and retrieving email content
+- **Index**: Manages message metadata, mailboxes, and search; returns paths for MailStore
 - **Authenticator**: Interface for authenticating IMAP connections
 - **UserStore**: Interface for managing user accounts and credentials
 - **Queue**: Interface for queueing asynchronous tasks
 
 ### Concrete Implementations
 
-The binary includes production-ready implementations:
+The library includes production-ready implementations:
 
-- **FilesystemMailStore**: Stores emails as files on the filesystem
-- **DefaultIndex**: Full-text search using Tantivy
-- **BasicAuthenticator**: Password-based authentication
+- **FilesystemMailStore**: Stores emails as files using channel-based writer loop
+- **InMemoryIndex**: In-memory metadata tracking with full-text search
+- **BasicAuthenticator**: Password-based authentication using UserStore
 - **SQLiteUserStore**: User management with SQLite and bcrypt password hashing
-- **InMemoryQueue**: FIFO task queue for background operations
+- **ChannelQueue**: FIFO task queue with graceful shutdown
 
 ## Usage
 
@@ -41,27 +52,33 @@ Add to your `Cargo.toml`:
 scuttled = "0.1.0"
 ```
 
-Implement your own storage backends:
+Use the default implementations:
 
 ```rust
 use scuttled::{MailStore, Index, Authenticator, UserStore, Queue};
 use scuttled::server::ImapServer;
-
-// Use the default implementations
-use scuttled::implementations::*;
+use scuttled::authenticator::r#impl::BasicAuthenticator;
+use scuttled::index::r#impl::InMemoryIndex;
+use scuttled::mailstore::r#impl::FilesystemMailStore;
+use scuttled::queue::r#impl::ChannelQueue;
+use scuttled::userstore::r#impl::SQLiteUserStore;
 
 #[async_std::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mail_store = FilesystemMailStore::new("./mail").await?;
-    let index = DefaultIndex::new("./index")?;
-    let user_store1 = SQLiteUserStore::new("./users.db").await?;
-    let user_store2 = SQLiteUserStore::new("./users.db").await?;
+    let mail_store = FilesystemMailStore::new("./data/mail").await?;
+    let index = InMemoryIndex::new();
+    let user_store1 = SQLiteUserStore::new("./data/users.db").await?;
+    let user_store2 = SQLiteUserStore::new("./data/users.db").await?;
+    let queue = ChannelQueue::new();
+
+    // Create a default user and mailbox
+    user_store1.create_user("test", "test").await?;
+    index.create_mailbox("test", "INBOX").await?;
+
     let authenticator = BasicAuthenticator::new(user_store1);
-    let queue = InMemoryQueue::new();
-
     let server = ImapServer::new(mail_store, index, authenticator, user_store2, queue);
-    server.listen("127.0.0.1:1143").await?;
 
+    server.listen("127.0.0.1:1143").await?;
     Ok(())
 }
 ```
@@ -78,7 +95,8 @@ cargo build --release
 The server will:
 - Listen on `127.0.0.1:1143`
 - Create a default user `test:test`
-- Store data in `./data/`
+- Store mail in `./data/mail/`
+- Store user database in `./data/users.db`
 
 Connect with any IMAP client:
 
@@ -104,9 +122,25 @@ cargo test
 ```
 
 Test coverage includes:
-- Unit tests for each component
-- Integration tests for full workflows
-- Concurrent operation tests
+- **Unit tests**: 32 tests for each component
+- **Integration tests**: Using external async-imap client for protocol compliance
+- **Component tests**: Path-based operations, metadata tracking, authentication
+
+All components have dedicated test suites that verify:
+- Basic functionality
+- Channel-based operations
+- Graceful shutdown
+- Concurrent access patterns
+
+## Architecture Benefits
+
+The channel-based architecture provides:
+
+- **Better Performance**: No lock contention, guaranteed write ordering
+- **Cleaner Separation**: Index handles metadata, MailStore handles content
+- **Easier Testing**: Each component is independently testable
+- **Graceful Shutdown**: All components can shut down cleanly
+- **Modularity**: Easy to swap implementations
 
 ## Development
 
@@ -115,22 +149,35 @@ Test coverage includes:
 ```
 scuttled/
 ├── src/
-│   ├── lib.rs              # Library entry point
-│   ├── types.rs            # Core types and data structures
-│   ├── traits.rs           # Trait abstractions
-│   ├── error.rs            # Error types
-│   ├── protocol.rs         # IMAP protocol parsing
-│   ├── server.rs           # IMAP server implementation
-│   ├── implementations/    # Concrete implementations
-│   │   ├── filesystem_mailstore.rs
-│   │   ├── default_index.rs
-│   │   ├── basic_authenticator.rs
-│   │   ├── sqlite_userstore.rs
-│   │   └── inmemory_queue.rs
+│   ├── lib.rs                    # Library entry point
+│   ├── types.rs                  # Core types and data structures
+│   ├── error.rs                  # Error types
+│   ├── protocol.rs               # IMAP protocol parsing
+│   ├── server.rs                 # IMAP server implementation
+│   ├── mailstore/
+│   │   ├── mod.rs                # MailStore trait
+│   │   └── impl/
+│   │       └── filesystem.rs     # Filesystem implementation
+│   ├── index/
+│   │   ├── mod.rs                # Index trait
+│   │   └── impl/
+│   │       └── inmemory.rs       # In-memory implementation
+│   ├── queue/
+│   │   ├── mod.rs                # Queue trait
+│   │   └── impl/
+│   │       └── channel.rs        # Channel-based implementation
+│   ├── authenticator/
+│   │   ├── mod.rs                # Authenticator trait
+│   │   └── impl/
+│   │       └── basic.rs          # Basic implementation
+│   ├── userstore/
+│   │   ├── mod.rs                # UserStore trait
+│   │   └── impl/
+│   │       └── sqlite.rs         # SQLite implementation
 │   └── bin/
-│       └── main.rs         # Binary entry point
+│       └── main.rs               # Binary entry point
 └── tests/
-    └── integration_tests.rs
+    └── integration_tests.rs      # Integration tests with async-imap
 ```
 
 ### Building
@@ -150,6 +197,55 @@ Or with logging:
 ```bash
 RUST_LOG=info cargo run
 ```
+
+## Implementation Details
+
+### Channel-Based Writer Loops
+
+Each component with mutable state uses a channel-based writer loop:
+
+```rust
+enum Command {
+    DoSomething(Data, oneshot::Sender<Result<Response>>),
+    Shutdown(oneshot::Sender<()>),
+}
+
+async fn writer_loop(rx: Receiver<Command>) {
+    let mut state = State::new();
+    while let Ok(cmd) = rx.recv().await {
+        match cmd {
+            Command::DoSomething(data, reply) => {
+                let result = state.process(data);
+                let _ = reply.send(result);
+            }
+            Command::Shutdown(reply) => {
+                let _ = reply.send(());
+                break;
+            }
+        }
+    }
+}
+```
+
+This pattern ensures:
+- Only one writer at a time (no locks needed)
+- Guaranteed operation ordering
+- Clean shutdown handling
+
+### Path-Based Storage
+
+The Index manages all metadata and returns paths to the MailStore:
+
+```rust
+// Index stores metadata and returns paths
+let path = index.add_message("alice", "INBOX", message).await?;
+
+// MailStore just stores/retrieves content at paths
+mail_store.store(&path, content).await?;
+let content = mail_store.retrieve(&path).await?;
+```
+
+Path format: `username/mailbox/message_id.eml`
 
 ## License
 
