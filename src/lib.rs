@@ -5,14 +5,21 @@
 
 pub mod error;
 pub mod types;
-pub mod traits;
 pub mod protocol;
 pub mod server;
-pub mod implementations;
+pub mod mailstore;
+pub mod index;
+pub mod queue;
+pub mod authenticator;
+pub mod userstore;
 
 pub use error::{Error, Result};
 pub use types::*;
-pub use traits::*;
+pub use mailstore::MailStore;
+pub use index::Index;
+pub use queue::Queue;
+pub use authenticator::Authenticator;
+pub use userstore::UserStore;
 
 #[cfg(test)]
 mod tests;
