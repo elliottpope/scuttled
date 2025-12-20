@@ -6,9 +6,9 @@ use async_std::prelude::*;
 use async_std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::protocol::{parse_command, Command, Response};
-use crate::traits::*;
+use crate::{Authenticator, Index, MailStore, Queue, UserStore};
 use crate::types::*;
 
 /// IMAP server state
