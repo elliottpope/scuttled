@@ -1,0 +1,36 @@
+[package]
+name = "scuttled"
+version = "0.1.0"
+edition = "2021"
+authors = ["Scuttled Contributors"]
+description = "An async IMAP server implementation in Rust"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/elliottpope/scuttled"
+
+[dependencies]
+async-std = { version = "1.12", features = ["attributes"] }
+async-trait = "0.1"
+tantivy = "0.22"
+rusqlite = { version = "0.31", features = ["bundled"] }
+thiserror = "1.0"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+env_logger = "0.11"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+futures = "0.3"
+bcrypt = "0.15"
+
+[dev-dependencies]
+tempfile = "3.8"
+serial_test = "3.0"
+
+[[bin]]
+name = "scuttled"
+path = "src/bin/main.rs"
+
+[lib]
+name = "scuttled"
+path = "src/lib.rs"
