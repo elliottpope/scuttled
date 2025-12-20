@@ -4,7 +4,6 @@ use async_std::io::{BufReader, WriteExt};
 use async_std::net::{TcpListener, TcpStream};
 use async_std::prelude::*;
 use async_std::sync::{Arc, RwLock};
-use std::collections::HashMap;
 
 use crate::error::Result;
 use crate::protocol::{parse_command, Command, Response};
@@ -55,7 +54,11 @@ where
     pub async fn listen(&self, addr: &str) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
         log::info!("IMAP server listening on {}", addr);
+        self.listen_on(listener).await
+    }
 
+    /// Listen on an existing TcpListener (useful for testing)
+    pub async fn listen_on(&self, listener: TcpListener) -> Result<()> {
         let mut incoming = listener.incoming();
         while let Some(stream) = incoming.next().await {
             let stream = stream?;
@@ -227,7 +230,7 @@ where
         }
     }
 
-    async fn handle_select(&self, tag: &str, mailbox: String, readonly: bool) -> Response {
+    async fn handle_select(&self, tag: &str, mailbox: String, _readonly: bool) -> Response {
         let state = self.state.read().await;
         let username = match &*state {
             SessionState::Authenticated { username } | SessionState::Selected { username, .. } => {
@@ -242,7 +245,7 @@ where
         };
         drop(state);
 
-        match self.mail_store.get_mailbox(&mailbox).await {
+        match self.index.get_mailbox(&username, &mailbox).await {
             Ok(Some(mb)) => {
                 let mut selected = self.selected_mailbox.write().await;
                 *selected = Some(mb.clone());
@@ -255,7 +258,7 @@ where
 
                 Response::Ok {
                     tag: Some(tag.to_string()),
-                    message: if readonly { "EXAMINE" } else { "SELECT" }.to_string() + " completed",
+                    message: "SELECT completed".to_string(),
                 }
             }
             Ok(None) => Response::No {
@@ -270,7 +273,21 @@ where
     }
 
     async fn handle_create(&self, tag: &str, mailbox: String) -> Response {
-        match self.mail_store.create_mailbox(&mailbox).await {
+        let state = self.state.read().await;
+        let username = match &*state {
+            SessionState::Authenticated { username } | SessionState::Selected { username, .. } => {
+                username.clone()
+            }
+            _ => {
+                return Response::No {
+                    tag: Some(tag.to_string()),
+                    message: "Must be authenticated".to_string(),
+                };
+            }
+        };
+        drop(state);
+
+        match self.index.create_mailbox(&username, &mailbox).await {
             Ok(_) => Response::Ok {
                 tag: Some(tag.to_string()),
                 message: "CREATE completed".to_string(),
@@ -283,11 +300,40 @@ where
     }
 
     async fn handle_delete(&self, tag: &str, mailbox: String) -> Response {
-        match self.mail_store.delete_mailbox(&mailbox).await {
-            Ok(_) => Response::Ok {
-                tag: Some(tag.to_string()),
-                message: "DELETE completed".to_string(),
-            },
+        let state = self.state.read().await;
+        let username = match &*state {
+            SessionState::Authenticated { username } | SessionState::Selected { username, .. } => {
+                username.clone()
+            }
+            _ => {
+                return Response::No {
+                    tag: Some(tag.to_string()),
+                    message: "Must be authenticated".to_string(),
+                };
+            }
+        };
+        drop(state);
+
+        // Get all message paths before deleting
+        match self.index.list_message_paths(&username, &mailbox).await {
+            Ok(paths) => {
+                // Delete all messages from MailStore
+                for path in paths {
+                    let _ = self.mail_store.delete(&path).await;
+                }
+
+                // Delete mailbox from Index
+                match self.index.delete_mailbox(&username, &mailbox).await {
+                    Ok(_) => Response::Ok {
+                        tag: Some(tag.to_string()),
+                        message: "DELETE completed".to_string(),
+                    },
+                    Err(e) => Response::No {
+                        tag: Some(tag.to_string()),
+                        message: format!("DELETE error: {}", e),
+                    },
+                }
+            }
             Err(e) => Response::No {
                 tag: Some(tag.to_string()),
                 message: format!("DELETE error: {}", e),
@@ -310,7 +356,7 @@ where
         };
         drop(state);
 
-        match self.mail_store.list_mailboxes(&username).await {
+        match self.index.list_mailboxes(&username).await {
             Ok(mailboxes) => {
                 for mb in mailboxes {
                     if pattern == "*" || mb.name.contains(&pattern) {

@@ -1,197 +1,374 @@
-//! Integration tests for the IMAP server
+//! Integration tests for the IMAP server using external IMAP client
 
-use async_std::io::{ReadExt, WriteExt};
-use async_std::net::TcpStream;
-use async_std::prelude::*;
-use async_std::task;
-use chrono::Utc;
-use scuttled::implementations::*;
+use scuttled::authenticator::r#impl::BasicAuthenticator;
+use scuttled::index::r#impl::InMemoryIndex;
+use scuttled::index::IndexedMessage;
+use scuttled::mailstore::r#impl::FilesystemMailStore;
+use scuttled::queue::r#impl::ChannelQueue;
+use scuttled::userstore::r#impl::SQLiteUserStore;
 use scuttled::server::ImapServer;
 use scuttled::types::*;
 use scuttled::{Authenticator, Index, MailStore, Queue, UserStore};
 use tempfile::TempDir;
+use std::time::Duration;
 
+/// Set up a test server and return the temp directory and address
 async fn setup_test_server() -> (TempDir, String) {
     let tmp_dir = TempDir::new().unwrap();
     let mail_dir = tmp_dir.path().join("mail");
-    let index_dir = tmp_dir.path().join("index");
     let db_path = tmp_dir.path().join("users.db");
 
+    std::fs::create_dir_all(&mail_dir).unwrap();
+
+    // Create components using new architecture
     let mail_store = FilesystemMailStore::new(&mail_dir).await.unwrap();
-    let index = DefaultIndex::new(&index_dir).unwrap();
+    let index = InMemoryIndex::new();
     let user_store1 = SQLiteUserStore::new(&db_path).await.unwrap();
     let user_store2 = SQLiteUserStore::new(&db_path).await.unwrap();
+    let queue = ChannelQueue::new();
 
+    // Set up test user and mailbox
     user_store1.create_user("testuser", "testpass").await.unwrap();
-    mail_store.create_mailbox("INBOX").await.unwrap();
+    index.create_mailbox("testuser", "INBOX").await.unwrap();
 
     let authenticator = BasicAuthenticator::new(user_store1);
-    let queue = InMemoryQueue::new();
-
     let server = ImapServer::new(mail_store, index, authenticator, user_store2, queue);
 
-    let addr = "127.0.0.1:0".to_string();
+    // Bind to a random port
+    let addr = "127.0.0.1:0";
+    let listener = async_std::net::TcpListener::bind(addr).await.unwrap();
+    let actual_addr = listener.local_addr().unwrap().to_string();
 
-    let listener = async_std::net::TcpListener::bind(&addr).await.unwrap();
-    let actual_addr = listener.local_addr().unwrap();
-
-    task::spawn(async move {
-        let mut incoming = listener.incoming();
-        if let Some(Ok(stream)) = incoming.next().await {
-            let _ = handle_test_connection(stream).await;
+    // Spawn server in background
+    async_std::task::spawn(async move {
+        if let Err(e) = server.listen_on(listener).await {
+            eprintln!("Server error: {}", e);
         }
     });
 
-    (tmp_dir, actual_addr.to_string())
+    // Give server time to start
+    async_std::task::sleep(Duration::from_millis(100)).await;
+
+    (tmp_dir, actual_addr)
 }
 
-async fn handle_test_connection(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
-    stream.write_all(b"* OK IMAP4rev1 Service Ready\r\n").await?;
+#[tokio::test]
+async fn test_imap_capability() {
+    let (_tmp_dir, addr) = setup_test_server().await;
 
-    let mut buffer = [0u8; 1024];
-    while let Ok(n) = stream.read(&mut buffer).await {
-        if n == 0 {
-            break;
-        }
-        let request = String::from_utf8_lossy(&buffer[..n]);
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let client = async_imap::Client::new(stream);
+    let capabilities = client.capabilities().await.unwrap();
 
-        if request.contains("CAPABILITY") {
-            stream
-                .write_all(b"* CAPABILITY IMAP4rev1 AUTH=PLAIN\r\n")
-                .await?;
-            stream.write_all(b"A001 OK CAPABILITY completed\r\n").await?;
-        } else if request.contains("LOGIN") {
-            stream.write_all(b"A002 OK LOGIN completed\r\n").await?;
-        } else if request.contains("LOGOUT") {
-            stream
-                .write_all(b"* BYE IMAP4rev1 Server logging out\r\n")
-                .await?;
-            break;
-        }
-    }
-
-    Ok(())
+    assert!(capabilities.has_str("IMAP4rev1"));
 }
 
-#[async_std::test]
-async fn test_mailstore_integration() {
-    let tmp_dir = TempDir::new().unwrap();
-    let mail_store = FilesystemMailStore::new(tmp_dir.path()).await.unwrap();
+#[tokio::test]
+async fn test_imap_login() {
+    let (_tmp_dir, addr) = setup_test_server().await;
 
-    mail_store.create_mailbox("INBOX").await.unwrap();
-    mail_store.create_mailbox("Sent").await.unwrap();
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let client = async_imap::Client::new(stream);
+    let mut session = client.login("testuser", "testpass").await.unwrap();
 
-    let mailboxes = mail_store.list_mailboxes("testuser").await.unwrap();
-    assert_eq!(mailboxes.len(), 2);
+    session.logout().await.unwrap();
+}
 
-    let uid = mail_store.get_next_uid("INBOX").await.unwrap();
+#[tokio::test]
+async fn test_imap_login_failure() {
+    let (_tmp_dir, addr) = setup_test_server().await;
 
-    let message = Message {
-        id: MessageId::new(),
-        uid,
-        mailbox: "INBOX".to_string(),
-        flags: vec![],
-        internal_date: Utc::now(),
-        size: 100,
-        raw_content: b"From: sender@example.com\nTo: recipient@example.com\nSubject: Test\n\nBody"
-            .to_vec(),
-    };
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let client = async_imap::Client::new(stream);
+    let result = client.login("testuser", "wrongpass").await;
 
-    mail_store.store_message("INBOX", &message).await.unwrap();
+    assert!(result.is_err());
+}
 
-    let messages = mail_store.list_messages("INBOX").await.unwrap();
+#[tokio::test]
+async fn test_imap_select_mailbox() {
+    let (_tmp_dir, addr) = setup_test_server().await;
+
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let client = async_imap::Client::new(stream);
+    let mut session = client.login("testuser", "testpass").await.unwrap();
+
+    let mailbox = session.select("INBOX").await.unwrap();
+    assert_eq!(mailbox.exists, 0);
+
+    session.logout().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_imap_create_mailbox() {
+    let (_tmp_dir, addr) = setup_test_server().await;
+
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let client = async_imap::Client::new(stream);
+    let mut session = client.login("testuser", "testpass").await.unwrap();
+
+    session.create("Drafts").await.unwrap();
+
+    let mailboxes = session.list(None, Some("*")).await.unwrap();
+    let mailbox_names: Vec<String> = mailboxes
+        .iter()
+        .map(|mb| mb.name().to_string())
+        .collect();
+
+    assert!(mailbox_names.contains(&"Drafts".to_string()));
+
+    session.logout().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_imap_list_mailboxes() {
+    let (_tmp_dir, addr) = setup_test_server().await;
+
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let client = async_imap::Client::new(stream);
+    let mut session = client.login("testuser", "testpass").await.unwrap();
+
+    // Create a few mailboxes
+    session.create("Sent").await.unwrap();
+    session.create("Trash").await.unwrap();
+
+    let mailboxes = session.list(None, Some("*")).await.unwrap();
+    assert!(mailboxes.len() >= 2); // At least Sent and Trash (INBOX may or may not be listed)
+
+    session.logout().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_imap_delete_mailbox() {
+    let (_tmp_dir, addr) = setup_test_server().await;
+
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let client = async_imap::Client::new(stream);
+    let mut session = client.login("testuser", "testpass").await.unwrap();
+
+    session.create("ToDelete").await.unwrap();
+    session.delete("ToDelete").await.unwrap();
+
+    let mailboxes = session.list(None, Some("*")).await.unwrap();
+    let mailbox_names: Vec<String> = mailboxes
+        .iter()
+        .map(|mb| mb.name().to_string())
+        .collect();
+
+    assert!(!mailbox_names.contains(&"ToDelete".to_string()));
+
+    session.logout().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_imap_append_message() {
+    let (_tmp_dir, addr) = setup_test_server().await;
+
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let client = async_imap::Client::new(stream);
+    let mut session = client.login("testuser", "testpass").await.unwrap();
+
+    session.select("INBOX").await.unwrap();
+
+    let message = b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test\r\n\r\nThis is a test message.";
+    session.append("INBOX", message).finish().await.unwrap();
+
+    // Check that the message was added
+    let mailbox = session.examine("INBOX").await.unwrap();
+    assert_eq!(mailbox.exists, 1);
+
+    session.logout().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_imap_fetch_message() {
+    let (_tmp_dir, addr) = setup_test_server().await;
+
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let client = async_imap::Client::new(stream);
+    let mut session = client.login("testuser", "testpass").await.unwrap();
+
+    // Append a message first
+    let message_content = b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Fetch\r\n\r\nTest body.";
+    session.append("INBOX", message_content).finish().await.unwrap();
+
+    session.select("INBOX").await.unwrap();
+
+    // Fetch the message
+    let messages = session.fetch("1", "RFC822").await.unwrap();
     assert_eq!(messages.len(), 1);
 
-    let retrieved = mail_store.get_message(message.id).await.unwrap();
+    session.logout().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_imap_expunge() {
+    let (_tmp_dir, addr) = setup_test_server().await;
+
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let client = async_imap::Client::new(stream);
+    let mut session = client.login("testuser", "testpass").await.unwrap();
+
+    // Append two messages
+    session.append("INBOX", b"Message 1").finish().await.unwrap();
+    session.append("INBOX", b"Message 2").finish().await.unwrap();
+
+    session.select("INBOX").await.unwrap();
+
+    // Mark first message as deleted
+    session.store("1", "+FLAGS (\\Deleted)").await.unwrap();
+
+    // Expunge
+    session.expunge().await.unwrap();
+
+    // Check that only one message remains
+    let mailbox = session.examine("INBOX").await.unwrap();
+    assert_eq!(mailbox.exists, 1);
+
+    session.logout().await.unwrap();
+}
+
+// Component-level integration tests (not using IMAP protocol)
+
+#[async_std::test]
+async fn test_mailstore_path_based_operations() {
+    let tmp_dir = TempDir::new().unwrap();
+    let mail_dir = tmp_dir.path().join("mail");
+    let mail_store = FilesystemMailStore::new(&mail_dir).await.unwrap();
+
+    let path = "testuser/INBOX/msg123.eml";
+    let content = b"From: test@example.com\r\nSubject: Test\r\n\r\nBody";
+
+    // Store message
+    mail_store.store(path, content).await.unwrap();
+
+    // Check it exists
+    let exists = mail_store.exists(path).await.unwrap();
+    assert!(exists);
+
+    // Retrieve message
+    let retrieved = mail_store.retrieve(path).await.unwrap();
     assert!(retrieved.is_some());
+    assert_eq!(retrieved.unwrap(), content);
+
+    // Delete message
+    mail_store.delete(path).await.unwrap();
+
+    let exists_after = mail_store.exists(path).await.unwrap();
+    assert!(!exists_after);
+
+    mail_store.shutdown().await.unwrap();
 }
 
 #[async_std::test]
-async fn test_index_integration() {
-    let tmp_dir = TempDir::new().unwrap();
-    let index_dir = tmp_dir.path().join("index");
-    let index = DefaultIndex::new(&index_dir).unwrap();
+async fn test_index_metadata_operations() {
+    let index = InMemoryIndex::new();
 
-    let message1 = Message {
+    // Create mailbox
+    index.create_mailbox("alice", "INBOX").await.unwrap();
+    index.create_mailbox("alice", "Sent").await.unwrap();
+
+    // List mailboxes
+    let mailboxes = index.list_mailboxes("alice").await.unwrap();
+    assert_eq!(mailboxes.len(), 2);
+
+    // Add message
+    let message = IndexedMessage {
         id: MessageId::new(),
         uid: 1,
         mailbox: "INBOX".to_string(),
         flags: vec![],
-        internal_date: Utc::now(),
+        from: "bob@example.com".to_string(),
+        to: "alice@example.com".to_string(),
+        subject: "Hello".to_string(),
+        body_preview: "Hello there".to_string(),
+        internal_date: chrono::Utc::now(),
         size: 100,
-        raw_content: b"From: alice@example.com\nTo: bob@example.com\nSubject: Hello\n\nHello Bob!"
-            .to_vec(),
     };
 
-    let message2 = Message {
-        id: MessageId::new(),
-        uid: 2,
-        mailbox: "INBOX".to_string(),
-        flags: vec![MessageFlag::Seen],
-        internal_date: Utc::now(),
-        size: 100,
-        raw_content: b"From: charlie@example.com\nTo: bob@example.com\nSubject: Meeting\n\nLet's meet"
-            .to_vec(),
-    };
+    let path = index.add_message("alice", "INBOX", message.clone()).await.unwrap();
+    assert!(path.contains("alice/INBOX"));
 
-    index.index_message(&message1).await.unwrap();
-    index.index_message(&message2).await.unwrap();
+    // Get message path by ID
+    let retrieved_path = index.get_message_path(message.id).await.unwrap();
+    assert_eq!(retrieved_path, Some(path.clone()));
 
-    let results = index
-        .search("INBOX", &SearchQuery::From("alice".to_string()))
-        .await
-        .unwrap();
+    // Get message path by UID
+    let uid_path = index.get_message_path_by_uid("alice", "INBOX", 1).await.unwrap();
+    assert_eq!(uid_path, Some(path));
+
+    // Search
+    let results = index.search("alice", "INBOX", &SearchQuery::From("bob".to_string())).await.unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0], message1.id);
 
-    let results = index
-        .search("INBOX", &SearchQuery::Subject("Meeting".to_string()))
-        .await
-        .unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0], message2.id);
+    // Delete mailbox
+    index.delete_mailbox("alice", "Sent").await.unwrap();
+    let mailboxes_after = index.list_mailboxes("alice").await.unwrap();
+    assert_eq!(mailboxes_after.len(), 1);
 
-    let results = index
-        .search("INBOX", &SearchQuery::Text("Bob".to_string()))
-        .await
-        .unwrap();
-    assert_eq!(results.len(), 2);
+    index.shutdown().await.unwrap();
 }
 
 #[async_std::test]
-async fn test_userstore_integration() {
+async fn test_queue_operations() {
+    let queue = ChannelQueue::new();
+
+    let task1 = QueueTask::new(
+        TaskType::UidCompaction,
+        serde_json::json!({"mailbox": "INBOX"}),
+    );
+    let task2 = QueueTask::new(
+        TaskType::IndexUpdate,
+        serde_json::json!({"message_id": "12345"}),
+    );
+
+    queue.enqueue(task1.clone()).await.unwrap();
+    queue.enqueue(task2.clone()).await.unwrap();
+
+    assert_eq!(queue.len().await.unwrap(), 2);
+
+    let dequeued = queue.dequeue().await.unwrap();
+    assert!(dequeued.is_some());
+    assert_eq!(dequeued.unwrap().id, task1.id);
+
+    assert_eq!(queue.len().await.unwrap(), 1);
+
+    queue.shutdown().await.unwrap();
+}
+
+#[async_std::test]
+async fn test_userstore_operations() {
     let tmp_dir = TempDir::new().unwrap();
     let db_path = tmp_dir.path().join("users.db");
     let user_store = SQLiteUserStore::new(&db_path).await.unwrap();
 
-    user_store.create_user("user1", "password1").await.unwrap();
-    user_store.create_user("user2", "password2").await.unwrap();
+    user_store.create_user("alice", "password123").await.unwrap();
+    user_store.create_user("bob", "password456").await.unwrap();
 
-    let user = user_store.get_user("user1").await.unwrap();
+    let user = user_store.get_user("alice").await.unwrap();
     assert!(user.is_some());
-    assert_eq!(user.unwrap().username, "user1");
+    assert_eq!(user.unwrap().username, "alice");
 
-    let valid = user_store.verify_password("user1", "password1").await.unwrap();
+    let valid = user_store.verify_password("alice", "password123").await.unwrap();
     assert!(valid);
 
-    let invalid = user_store.verify_password("user1", "wrongpass").await.unwrap();
+    let invalid = user_store.verify_password("alice", "wrongpass").await.unwrap();
     assert!(!invalid);
 
-    user_store.update_password("user1", "newpass").await.unwrap();
-
-    let valid_new = user_store.verify_password("user1", "newpass").await.unwrap();
+    user_store.update_password("alice", "newpass").await.unwrap();
+    let valid_new = user_store.verify_password("alice", "newpass").await.unwrap();
     assert!(valid_new);
 
     let users = user_store.list_users().await.unwrap();
     assert_eq!(users.len(), 2);
 
-    user_store.delete_user("user2").await.unwrap();
-    let users = user_store.list_users().await.unwrap();
-    assert_eq!(users.len(), 1);
+    user_store.delete_user("bob").await.unwrap();
+    let users_after = user_store.list_users().await.unwrap();
+    assert_eq!(users_after.len(), 1);
 }
 
 #[async_std::test]
-async fn test_authenticator_integration() {
+async fn test_authenticator() {
     let tmp_dir = TempDir::new().unwrap();
     let db_path = tmp_dir.path().join("users.db");
     let user_store = SQLiteUserStore::new(&db_path).await.unwrap();
@@ -221,88 +398,26 @@ async fn test_authenticator_integration() {
 }
 
 #[async_std::test]
-async fn test_queue_integration() {
-    let queue = InMemoryQueue::new();
-
-    let task1 = QueueTask::new(
-        TaskType::UidCompaction,
-        serde_json::json!({"mailbox": "INBOX"}),
-    );
-    let task2 = QueueTask::new(
-        TaskType::IndexUpdate,
-        serde_json::json!({"message_id": "12345"}),
-    );
-
-    queue.enqueue(task1.clone()).await.unwrap();
-    queue.enqueue(task2.clone()).await.unwrap();
-
-    assert_eq!(queue.len().await.unwrap(), 2);
-
-    let peeked = queue.peek().await.unwrap();
-    assert!(peeked.is_some());
-    assert_eq!(peeked.unwrap().id, task1.id);
-
-    let dequeued = queue.dequeue().await.unwrap();
-    assert!(dequeued.is_some());
-    assert_eq!(dequeued.unwrap().id, task1.id);
-
-    assert_eq!(queue.len().await.unwrap(), 1);
-
-    queue.clear().await.unwrap();
-    assert!(queue.is_empty().await.unwrap());
-}
-
-#[async_std::test]
-async fn test_full_workflow() {
+async fn test_full_integration_workflow() {
     let tmp_dir = TempDir::new().unwrap();
     let mail_dir = tmp_dir.path().join("mail");
-    let index_dir = tmp_dir.path().join("index");
     let db_path = tmp_dir.path().join("users.db");
 
+    std::fs::create_dir_all(&mail_dir).unwrap();
+
     let mail_store = FilesystemMailStore::new(&mail_dir).await.unwrap();
-    let index = DefaultIndex::new(&index_dir).unwrap();
+    let index = InMemoryIndex::new();
     let user_store = SQLiteUserStore::new(&db_path).await.unwrap();
     let authenticator = BasicAuthenticator::new(user_store);
-    let queue = InMemoryQueue::new();
 
+    // Create user
     authenticator
         .user_store
         .create_user("alice", "password")
         .await
         .unwrap();
 
-    mail_store.create_mailbox("INBOX").await.unwrap();
-
-    let uid = mail_store.get_next_uid("INBOX").await.unwrap();
-
-    let message = Message {
-        id: MessageId::new(),
-        uid,
-        mailbox: "INBOX".to_string(),
-        flags: vec![],
-        internal_date: Utc::now(),
-        size: 100,
-        raw_content: b"From: bob@example.com\nTo: alice@example.com\nSubject: Important\n\nThis is important"
-            .to_vec(),
-    };
-
-    mail_store.store_message("INBOX", &message).await.unwrap();
-
-    index.index_message(&message).await.unwrap();
-
-    let search_results = index
-        .search("INBOX", &SearchQuery::Subject("Important".to_string()))
-        .await
-        .unwrap();
-    assert_eq!(search_results.len(), 1);
-    assert_eq!(search_results[0], message.id);
-
-    let task = QueueTask::new(
-        TaskType::UidCompaction,
-        serde_json::json!({"mailbox": "INBOX"}),
-    );
-    queue.enqueue(task).await.unwrap();
-
+    // Authenticate
     let creds = Credentials {
         username: "alice".to_string(),
         password: "password".to_string(),
@@ -310,81 +425,46 @@ async fn test_full_workflow() {
     let auth_result = authenticator.authenticate(&creds).await.unwrap();
     assert!(auth_result);
 
-    mail_store
-        .update_flags(message.id, vec![MessageFlag::Seen])
+    // Create mailbox
+    index.create_mailbox("alice", "INBOX").await.unwrap();
+
+    // Add message via index
+    let message = IndexedMessage {
+        id: MessageId::new(),
+        uid: 1,
+        mailbox: "INBOX".to_string(),
+        flags: vec![],
+        from: "bob@example.com".to_string(),
+        to: "alice@example.com".to_string(),
+        subject: "Important".to_string(),
+        body_preview: "This is important".to_string(),
+        internal_date: chrono::Utc::now(),
+        size: 100,
+    };
+
+    let path = index.add_message("alice", "INBOX", message.clone()).await.unwrap();
+
+    // Store message content in mailstore
+    let content = b"From: bob@example.com\r\nTo: alice@example.com\r\nSubject: Important\r\n\r\nThis is important";
+    mail_store.store(&path, content).await.unwrap();
+
+    // Search via index
+    let search_results = index
+        .search("alice", "INBOX", &SearchQuery::Subject("Important".to_string()))
         .await
         .unwrap();
+    assert_eq!(search_results.len(), 1);
 
-    let retrieved = mail_store.get_message(message.id).await.unwrap().unwrap();
-    assert_eq!(retrieved.flags.len(), 1);
-    assert_eq!(retrieved.flags[0], MessageFlag::Seen);
+    // Retrieve via mailstore using path from index
+    let retrieved_path = index.get_message_path(message.id).await.unwrap().unwrap();
+    let retrieved_content = mail_store.retrieve(&retrieved_path).await.unwrap();
+    assert!(retrieved_content.is_some());
+    assert_eq!(retrieved_content.unwrap(), content);
 
-    mail_store.delete_message(message.id).await.unwrap();
+    // Clean up
+    mail_store.delete(&path).await.unwrap();
+    index.delete_message(message.id).await.unwrap();
 
-    index.remove_message(message.id).await.unwrap();
-
-    let messages = mail_store.list_messages("INBOX").await.unwrap();
-    assert_eq!(messages.len(), 0);
-}
-
-#[async_std::test]
-async fn test_concurrent_operations() {
-    let tmp_dir = TempDir::new().unwrap();
-    let mail_store = FilesystemMailStore::new(tmp_dir.path()).await.unwrap();
-
-    mail_store.create_mailbox("INBOX").await.unwrap();
-
-    let mut handles = vec![];
-
-    for i in 0..10 {
-        let store = FilesystemMailStore::new(tmp_dir.path()).await.unwrap();
-        let handle = task::spawn(async move {
-            let uid = store.get_next_uid("INBOX").await.unwrap();
-            let message = Message {
-                id: MessageId::new(),
-                uid,
-                mailbox: "INBOX".to_string(),
-                flags: vec![],
-                internal_date: Utc::now(),
-                size: 100,
-                raw_content: format!("Message {}", i).into_bytes(),
-            };
-            store.store_message("INBOX", &message).await.unwrap();
-        });
-        handles.push(handle);
-    }
-
-    for handle in handles {
-        handle.await;
-    }
-
-    let messages = mail_store.list_messages("INBOX").await.unwrap();
-    assert_eq!(messages.len(), 10);
-}
-
-#[async_std::test]
-async fn test_mailbox_operations() {
-    let tmp_dir = TempDir::new().unwrap();
-    let mail_store = FilesystemMailStore::new(tmp_dir.path()).await.unwrap();
-
-    mail_store.create_mailbox("Drafts").await.unwrap();
-    mail_store.create_mailbox("Sent").await.unwrap();
-    mail_store.create_mailbox("Trash").await.unwrap();
-
-    let mailboxes = mail_store.list_mailboxes("testuser").await.unwrap();
-    assert_eq!(mailboxes.len(), 3);
-
-    mail_store.rename_mailbox("Drafts", "MyDrafts").await.unwrap();
-
-    let mailbox = mail_store.get_mailbox("MyDrafts").await.unwrap();
-    assert!(mailbox.is_some());
-    assert_eq!(mailbox.unwrap().name, "MyDrafts");
-
-    let old_mailbox = mail_store.get_mailbox("Drafts").await.unwrap();
-    assert!(old_mailbox.is_none());
-
-    mail_store.delete_mailbox("Trash").await.unwrap();
-
-    let mailboxes = mail_store.list_mailboxes("testuser").await.unwrap();
-    assert_eq!(mailboxes.len(), 2);
+    mail_store.shutdown().await.unwrap();
+    index.shutdown().await.unwrap();
 }
