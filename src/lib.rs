@@ -12,6 +12,8 @@ pub mod index;
 pub mod queue;
 pub mod authenticator;
 pub mod userstore;
+pub mod command_handler;
+pub mod session_context;
 
 pub use error::{Error, Result};
 pub use types::*;
@@ -20,6 +22,8 @@ pub use index::Index;
 pub use queue::Queue;
 pub use authenticator::Authenticator;
 pub use userstore::UserStore;
+pub use command_handler::CommandHandler;
+pub use session_context::{SessionContext, SessionState};
 
 #[cfg(test)]
 mod tests;

@@ -4,7 +4,6 @@
 //! and managing mailbox state. It returns file paths for the MailStore to use.
 
 use async_trait::async_trait;
-use uuid::Uuid;
 use crate::error::Result;
 use crate::types::*;
 

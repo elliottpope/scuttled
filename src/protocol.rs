@@ -27,6 +27,8 @@ pub enum Command {
     Store { sequence: String, flags: Vec<String>, add: bool },
     Copy { sequence: String, mailbox: String },
     Uid { command: Box<Command> },
+    /// Custom command for extensibility (command_name, args)
+    Custom { name: String, args: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,7 +83,7 @@ impl fmt::Display for Response {
 }
 
 /// Parse an IMAP command from a line of input
-pub fn parse_command(tag: &str, line: &str) -> Result<Command> {
+pub fn parse_command(_tag: &str, line: &str) -> Result<Command> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
         return Err(Error::ProtocolError("Empty command".to_string()));
@@ -144,7 +146,18 @@ pub fn parse_command(tag: &str, line: &str) -> Result<Command> {
         }
         "CLOSE" => Ok(Command::Close),
         "EXPUNGE" => Ok(Command::Expunge),
-        _ => Err(Error::ProtocolError(format!("Unknown command: {}", cmd))),
+        // Unknown commands are treated as custom commands for extensibility
+        _ => {
+            let args = if parts.len() > 1 {
+                parts[1..].join(" ")
+            } else {
+                String::new()
+            };
+            Ok(Command::Custom {
+                name: cmd,
+                args,
+            })
+        }
     }
 }
 

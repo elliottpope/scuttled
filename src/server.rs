@@ -3,51 +3,57 @@
 use async_std::io::{BufReader, WriteExt};
 use async_std::net::{TcpListener, TcpStream};
 use async_std::prelude::*;
-use async_std::sync::{Arc, RwLock};
+use async_std::sync::Arc;
+use std::collections::HashMap;
 
 use crate::error::Result;
 use crate::protocol::{parse_command, Command, Response};
-use crate::{Authenticator, Index, MailStore, Queue, UserStore};
+use crate::{Authenticator, Index, MailStore, Queue, UserStore, CommandHandler};
+use crate::session_context::{SessionContext, SessionState};
 use crate::types::*;
 
-/// IMAP server state
-pub struct ImapServer<M, I, A, U, Q>
-where
-    M: MailStore,
-    I: Index,
-    A: Authenticator,
-    U: UserStore,
-    Q: Queue,
-{
-    mail_store: Arc<M>,
-    index: Arc<I>,
-    authenticator: Arc<A>,
-    user_store: Arc<U>,
-    queue: Arc<Q>,
+/// IMAP server with support for custom command handlers
+pub struct ImapServer {
+    mail_store: Arc<dyn MailStore>,
+    index: Arc<dyn Index>,
+    authenticator: Arc<dyn Authenticator>,
+    user_store: Arc<dyn UserStore>,
+    queue: Arc<dyn Queue>,
+    custom_handlers: Arc<HashMap<String, Arc<dyn CommandHandler>>>,
 }
 
-impl<M, I, A, U, Q> ImapServer<M, I, A, U, Q>
-where
-    M: MailStore + 'static,
-    I: Index + 'static,
-    A: Authenticator + 'static,
-    U: UserStore + 'static,
-    Q: Queue + 'static,
-{
-    pub fn new(
+impl ImapServer {
+    /// Create a new IMAP server with the given stores
+    pub fn new<M, I, A, U, Q>(
         mail_store: M,
         index: I,
         authenticator: A,
         user_store: U,
         queue: Q,
-    ) -> Self {
+    ) -> Self
+    where
+        M: MailStore + 'static,
+        I: Index + 'static,
+        A: Authenticator + 'static,
+        U: UserStore + 'static,
+        Q: Queue + 'static,
+    {
         Self {
             mail_store: Arc::new(mail_store),
             index: Arc::new(index),
             authenticator: Arc::new(authenticator),
             user_store: Arc::new(user_store),
             queue: Arc::new(queue),
+            custom_handlers: Arc::new(HashMap::new()),
         }
+    }
+
+    /// Register a custom command handler
+    ///
+    /// This allows library users to extend the server with custom IMAP commands.
+    pub fn register_handler(&mut self, handler: Arc<dyn CommandHandler>) {
+        let handlers = Arc::make_mut(&mut self.custom_handlers);
+        handlers.insert(handler.command_name().to_uppercase(), handler);
     }
 
     /// Start the IMAP server on the specified address
@@ -62,14 +68,20 @@ where
         let mut incoming = listener.incoming();
         while let Some(stream) = incoming.next().await {
             let stream = stream?;
-            let session = Session {
+
+            let context = SessionContext {
                 mail_store: Arc::clone(&self.mail_store),
                 index: Arc::clone(&self.index),
                 authenticator: Arc::clone(&self.authenticator),
                 user_store: Arc::clone(&self.user_store),
                 queue: Arc::clone(&self.queue),
-                state: Arc::new(RwLock::new(SessionState::NotAuthenticated)),
-                selected_mailbox: Arc::new(RwLock::new(None)),
+                state: Arc::new(async_std::sync::RwLock::new(SessionState::NotAuthenticated)),
+                selected_mailbox: Arc::new(async_std::sync::RwLock::new(None)),
+            };
+
+            let session = Session {
+                context,
+                custom_handlers: Arc::clone(&self.custom_handlers),
             };
 
             async_std::task::spawn(async move {
@@ -83,41 +95,13 @@ where
     }
 }
 
-/// Session state
-#[derive(Debug, Clone, PartialEq)]
-enum SessionState {
-    NotAuthenticated,
-    Authenticated { username: Username },
-    Selected { username: Username, mailbox: MailboxName },
-    Logout,
-}
-
 /// Client session
-struct Session<M, I, A, U, Q>
-where
-    M: MailStore,
-    I: Index,
-    A: Authenticator,
-    U: UserStore,
-    Q: Queue,
-{
-    mail_store: Arc<M>,
-    index: Arc<I>,
-    authenticator: Arc<A>,
-    user_store: Arc<U>,
-    queue: Arc<Q>,
-    state: Arc<RwLock<SessionState>>,
-    selected_mailbox: Arc<RwLock<Option<Mailbox>>>,
+struct Session {
+    context: SessionContext,
+    custom_handlers: Arc<HashMap<String, Arc<dyn CommandHandler>>>,
 }
 
-impl<M, I, A, U, Q> Session<M, I, A, U, Q>
-where
-    M: MailStore,
-    I: Index,
-    A: Authenticator,
-    U: UserStore,
-    Q: Queue,
-{
+impl Session {
     async fn handle(&self, stream: TcpStream) -> Result<()> {
         let mut stream = stream;
 
@@ -136,8 +120,7 @@ where
 
             stream.write_all(response_str.as_bytes()).await?;
 
-            let state = self.state.read().await;
-            if *state == SessionState::Logout {
+            if matches!(self.context.get_state().await, SessionState::Logout) {
                 break;
             }
         }
@@ -168,38 +151,21 @@ where
 
     async fn handle_command(&self, tag: &str, command: Command) -> Response {
         match command {
-            Command::Capability => {
-                Response::Untagged {
-                    message: "CAPABILITY IMAP4rev1 AUTH=PLAIN".to_string(),
-                };
-                Response::Ok {
-                    tag: Some(tag.to_string()),
-                    message: "CAPABILITY completed".to_string(),
-                }
-            }
+            Command::Capability => self.handle_capability(tag).await,
             Command::Noop => Response::Ok {
                 tag: Some(tag.to_string()),
                 message: "NOOP completed".to_string(),
             },
-            Command::Logout => {
-                let mut state = self.state.write().await;
-                *state = SessionState::Logout;
-                Response::Bye {
-                    message: "IMAP4rev1 Server logging out".to_string(),
-                }
-            }
-            Command::Login { username, password } => {
-                self.handle_login(tag, username, password).await
-            }
+            Command::Logout => self.handle_logout(tag).await,
+            Command::Login { username, password } => self.handle_login(tag, username, password).await,
             Command::Select { mailbox } => self.handle_select(tag, mailbox, false).await,
             Command::Examine { mailbox } => self.handle_select(tag, mailbox, true).await,
             Command::Create { mailbox } => self.handle_create(tag, mailbox).await,
             Command::Delete { mailbox } => self.handle_delete(tag, mailbox).await,
-            Command::List { reference, pattern } => {
-                self.handle_list(tag, reference, pattern).await
-            }
+            Command::List { reference, pattern } => self.handle_list(tag, reference, pattern).await,
             Command::Close => self.handle_close(tag).await,
             Command::Expunge => self.handle_expunge(tag).await,
+            Command::Custom { name, args } => self.handle_custom(tag, &name, &args).await,
             _ => Response::Bad {
                 tag: Some(tag.to_string()),
                 message: "Command not implemented".to_string(),
@@ -207,163 +173,204 @@ where
         }
     }
 
+    async fn handle_custom(&self, tag: &str, name: &str, args: &str) -> Response {
+        let name_upper = name.to_uppercase();
+
+        if let Some(handler) = self.custom_handlers.get(&name_upper) {
+            // Check authentication requirement
+            if handler.requires_auth() && !self.context.is_authenticated().await {
+                return Response::No {
+                    tag: Some(tag.to_string()),
+                    message: "Authentication required".to_string(),
+                };
+            }
+
+            // Check mailbox selection requirement
+            if handler.requires_selected_mailbox() && !self.context.has_selected_mailbox().await {
+                return Response::No {
+                    tag: Some(tag.to_string()),
+                    message: "No mailbox selected".to_string(),
+                };
+            }
+
+            // Clone context for the handler
+            let mut handler_context = SessionContext {
+                mail_store: Arc::clone(&self.context.mail_store),
+                index: Arc::clone(&self.context.index),
+                authenticator: Arc::clone(&self.context.authenticator),
+                user_store: Arc::clone(&self.context.user_store),
+                queue: Arc::clone(&self.context.queue),
+                state: Arc::clone(&self.context.state),
+                selected_mailbox: Arc::clone(&self.context.selected_mailbox),
+            };
+
+            match handler.handle(tag, args, &mut handler_context).await {
+                Ok(response) => response,
+                Err(e) => Response::No {
+                    tag: Some(tag.to_string()),
+                    message: format!("Handler error: {}", e),
+                },
+            }
+        } else {
+            Response::Bad {
+                tag: Some(tag.to_string()),
+                message: format!("Unknown command: {}", name),
+            }
+        }
+    }
+
+    async fn handle_capability(&self, tag: &str) -> Response {
+        let capabilities = "CAPABILITY IMAP4rev1";
+        Response::Untagged {
+            message: capabilities.to_string(),
+        };
+        Response::Ok {
+            tag: Some(tag.to_string()),
+            message: "CAPABILITY completed".to_string(),
+        }
+    }
+
+    async fn handle_logout(&self, tag: &str) -> Response {
+        self.context.set_state(SessionState::Logout).await;
+        Response::Bye {
+            message: "IMAP4rev1 Server logging out".to_string(),
+        };
+        Response::Ok {
+            tag: Some(tag.to_string()),
+            message: "LOGOUT completed".to_string(),
+        }
+    }
+
     async fn handle_login(&self, tag: &str, username: String, password: String) -> Response {
         let creds = Credentials { username: username.clone(), password };
 
-        match self.authenticator.authenticate(&creds).await {
+        match self.context.authenticator.authenticate(&creds).await {
             Ok(true) => {
-                let mut state = self.state.write().await;
-                *state = SessionState::Authenticated { username };
+                self.context.set_state(SessionState::Authenticated {
+                    username: username.clone(),
+                }).await;
                 Response::Ok {
                     tag: Some(tag.to_string()),
-                    message: "LOGIN completed".to_string(),
+                    message: format!("{} logged in", username),
                 }
             }
             Ok(false) => Response::No {
                 tag: Some(tag.to_string()),
-                message: "LOGIN failed".to_string(),
+                message: "Invalid credentials".to_string(),
             },
             Err(e) => Response::No {
                 tag: Some(tag.to_string()),
-                message: format!("LOGIN error: {}", e),
+                message: format!("Authentication error: {}", e),
             },
         }
     }
 
-    async fn handle_select(&self, tag: &str, mailbox: String, _readonly: bool) -> Response {
-        let state = self.state.read().await;
-        let username = match &*state {
-            SessionState::Authenticated { username } | SessionState::Selected { username, .. } => {
-                username.clone()
-            }
-            _ => {
-                return Response::No {
-                    tag: Some(tag.to_string()),
-                    message: "Must be authenticated".to_string(),
-                };
-            }
+    async fn handle_select(&self, tag: &str, mailbox: String, readonly: bool) -> Response {
+        let username = match self.context.get_username().await {
+            Some(u) => u,
+            None => return Response::No {
+                tag: Some(tag.to_string()),
+                message: "Not authenticated".to_string(),
+            },
         };
-        drop(state);
 
-        match self.index.get_mailbox(&username, &mailbox).await {
-            Ok(Some(mb)) => {
-                let mut selected = self.selected_mailbox.write().await;
-                *selected = Some(mb.clone());
-
-                let mut state = self.state.write().await;
-                *state = SessionState::Selected {
+        match self.context.index.get_mailbox(&username, &mailbox).await {
+            Ok(Some(_mb)) => {
+                self.context.set_state(SessionState::Selected {
                     username,
                     mailbox: mailbox.clone(),
-                };
+                }).await;
+                self.context.set_selected_mailbox(Some(mailbox)).await;
 
+                let cmd = if readonly { "EXAMINE" } else { "SELECT" };
                 Response::Ok {
                     tag: Some(tag.to_string()),
-                    message: "SELECT completed".to_string(),
+                    message: format!("{} completed", cmd),
                 }
             }
             Ok(None) => Response::No {
                 tag: Some(tag.to_string()),
-                message: "Mailbox does not exist".to_string(),
+                message: format!("Mailbox {} not found", mailbox),
             },
             Err(e) => Response::No {
                 tag: Some(tag.to_string()),
-                message: format!("SELECT error: {}", e),
+                message: format!("Error: {}", e),
             },
         }
     }
 
     async fn handle_create(&self, tag: &str, mailbox: String) -> Response {
-        let state = self.state.read().await;
-        let username = match &*state {
-            SessionState::Authenticated { username } | SessionState::Selected { username, .. } => {
-                username.clone()
-            }
-            _ => {
-                return Response::No {
-                    tag: Some(tag.to_string()),
-                    message: "Must be authenticated".to_string(),
-                };
-            }
+        let username = match self.context.get_username().await {
+            Some(u) => u,
+            None => return Response::No {
+                tag: Some(tag.to_string()),
+                message: "Not authenticated".to_string(),
+            },
         };
-        drop(state);
 
-        match self.index.create_mailbox(&username, &mailbox).await {
-            Ok(_) => Response::Ok {
+        match self.context.index.create_mailbox(&username, &mailbox).await {
+            Ok(()) => Response::Ok {
                 tag: Some(tag.to_string()),
                 message: "CREATE completed".to_string(),
             },
             Err(e) => Response::No {
                 tag: Some(tag.to_string()),
-                message: format!("CREATE error: {}", e),
+                message: format!("Error: {}", e),
             },
         }
     }
 
     async fn handle_delete(&self, tag: &str, mailbox: String) -> Response {
-        let state = self.state.read().await;
-        let username = match &*state {
-            SessionState::Authenticated { username } | SessionState::Selected { username, .. } => {
-                username.clone()
-            }
-            _ => {
-                return Response::No {
-                    tag: Some(tag.to_string()),
-                    message: "Must be authenticated".to_string(),
-                };
-            }
+        let username = match self.context.get_username().await {
+            Some(u) => u,
+            None => return Response::No {
+                tag: Some(tag.to_string()),
+                message: "Not authenticated".to_string(),
+            },
         };
-        drop(state);
 
-        // Get all message paths before deleting
-        match self.index.list_message_paths(&username, &mailbox).await {
+        // Get all message paths for this mailbox
+        match self.context.index.list_message_paths(&username, &mailbox).await {
             Ok(paths) => {
                 // Delete all messages from MailStore
                 for path in paths {
-                    let _ = self.mail_store.delete(&path).await;
+                    let _ = self.context.mail_store.delete(&path).await;
                 }
 
                 // Delete mailbox from Index
-                match self.index.delete_mailbox(&username, &mailbox).await {
-                    Ok(_) => Response::Ok {
+                match self.context.index.delete_mailbox(&username, &mailbox).await {
+                    Ok(()) => Response::Ok {
                         tag: Some(tag.to_string()),
                         message: "DELETE completed".to_string(),
                     },
                     Err(e) => Response::No {
                         tag: Some(tag.to_string()),
-                        message: format!("DELETE error: {}", e),
+                        message: format!("Error: {}", e),
                     },
                 }
             }
             Err(e) => Response::No {
                 tag: Some(tag.to_string()),
-                message: format!("DELETE error: {}", e),
+                message: format!("Error: {}", e),
             },
         }
     }
 
-    async fn handle_list(&self, tag: &str, _reference: String, pattern: String) -> Response {
-        let state = self.state.read().await;
-        let username = match &*state {
-            SessionState::Authenticated { username } | SessionState::Selected { username, .. } => {
-                username.clone()
-            }
-            _ => {
-                return Response::No {
-                    tag: Some(tag.to_string()),
-                    message: "Must be authenticated".to_string(),
-                };
-            }
+    async fn handle_list(&self, tag: &str, _reference: String, _pattern: String) -> Response {
+        let username = match self.context.get_username().await {
+            Some(u) => u,
+            None => return Response::No {
+                tag: Some(tag.to_string()),
+                message: "Not authenticated".to_string(),
+            },
         };
-        drop(state);
 
-        match self.index.list_mailboxes(&username).await {
+        match self.context.index.list_mailboxes(&username).await {
             Ok(mailboxes) => {
-                for mb in mailboxes {
-                    if pattern == "*" || mb.name.contains(&pattern) {
-                        let _untagged = Response::Untagged {
-                            message: format!("LIST () \"/\" \"{}\"", mb.name),
-                        };
-                    }
+                for mailbox in mailboxes {
+                    Response::Untagged {
+                        message: format!("LIST () \"/\" \"{}\"", mailbox.name),
+                    };
                 }
                 Response::Ok {
                     tag: Some(tag.to_string()),
@@ -372,18 +379,16 @@ where
             }
             Err(e) => Response::No {
                 tag: Some(tag.to_string()),
-                message: format!("LIST error: {}", e),
+                message: format!("Error: {}", e),
             },
         }
     }
 
     async fn handle_close(&self, tag: &str) -> Response {
-        let mut selected = self.selected_mailbox.write().await;
-        *selected = None;
+        self.context.set_selected_mailbox(None).await;
 
-        let mut state = self.state.write().await;
-        if let SessionState::Selected { username, .. } = &*state {
-            *state = SessionState::Authenticated { username: username.clone() };
+        if let Some(username) = self.context.get_username().await {
+            self.context.set_state(SessionState::Authenticated { username }).await;
         }
 
         Response::Ok {
