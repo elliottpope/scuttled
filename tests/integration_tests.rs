@@ -5,12 +5,13 @@ use scuttled::index::r#impl::InMemoryIndex;
 use scuttled::index::IndexedMessage;
 use scuttled::mailstore::r#impl::FilesystemMailStore;
 use scuttled::queue::r#impl::ChannelQueue;
-use scuttled::userstore::r#impl::SQLiteUserStore;
 use scuttled::server::ImapServer;
 use scuttled::types::*;
+use scuttled::userstore::r#impl::SQLiteUserStore;
 use scuttled::{Authenticator, Index, MailStore, Queue, UserStore};
-use tempfile::TempDir;
+use std::sync::Arc;
 use std::time::Duration;
+use tempfile::TempDir;
 
 /// Set up a test server and return the temp directory and address
 async fn setup_test_server() -> (TempDir, String) {
@@ -23,16 +24,18 @@ async fn setup_test_server() -> (TempDir, String) {
     // Create components using new architecture
     let mail_store = FilesystemMailStore::new(&mail_dir).await.unwrap();
     let index = InMemoryIndex::new();
-    let user_store1 = SQLiteUserStore::new(&db_path).await.unwrap();
-    let user_store2 = SQLiteUserStore::new(&db_path).await.unwrap();
+    let user_store = Arc::new(SQLiteUserStore::new(&db_path).await.unwrap());
     let queue = ChannelQueue::new();
 
     // Set up test user and mailbox
-    user_store1.create_user("testuser", "testpass").await.unwrap();
+    user_store
+        .create_user("testuser", "testpass")
+        .await
+        .unwrap();
     index.create_mailbox("testuser", "INBOX").await.unwrap();
 
-    let authenticator = BasicAuthenticator::new(user_store1);
-    let server = ImapServer::new(mail_store, index, authenticator, user_store2, queue);
+    let authenticator = BasicAuthenticator::new(user_store);
+    let server = ImapServer::new(mail_store, index, authenticator, user_store, queue);
 
     // Bind to a random port
     let addr = "127.0.0.1:0";
@@ -110,10 +113,7 @@ async fn test_imap_create_mailbox() {
     session.create("Drafts").await.unwrap();
 
     let mailboxes = session.list(None, Some("*")).await.unwrap();
-    let mailbox_names: Vec<String> = mailboxes
-        .iter()
-        .map(|mb| mb.name().to_string())
-        .collect();
+    let mailbox_names: Vec<String> = mailboxes.iter().map(|mb| mb.name().to_string()).collect();
 
     assert!(mailbox_names.contains(&"Drafts".to_string()));
 
@@ -150,10 +150,7 @@ async fn test_imap_delete_mailbox() {
     session.delete("ToDelete").await.unwrap();
 
     let mailboxes = session.list(None, Some("*")).await.unwrap();
-    let mailbox_names: Vec<String> = mailboxes
-        .iter()
-        .map(|mb| mb.name().to_string())
-        .collect();
+    let mailbox_names: Vec<String> = mailboxes.iter().map(|mb| mb.name().to_string()).collect();
 
     assert!(!mailbox_names.contains(&"ToDelete".to_string()));
 
@@ -190,7 +187,11 @@ async fn test_imap_fetch_message() {
 
     // Append a message first
     let message_content = b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Fetch\r\n\r\nTest body.";
-    session.append("INBOX", message_content).finish().await.unwrap();
+    session
+        .append("INBOX", message_content)
+        .finish()
+        .await
+        .unwrap();
 
     session.select("INBOX").await.unwrap();
 
@@ -210,8 +211,16 @@ async fn test_imap_expunge() {
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
     // Append two messages
-    session.append("INBOX", b"Message 1").finish().await.unwrap();
-    session.append("INBOX", b"Message 2").finish().await.unwrap();
+    session
+        .append("INBOX", b"Message 1")
+        .finish()
+        .await
+        .unwrap();
+    session
+        .append("INBOX", b"Message 2")
+        .finish()
+        .await
+        .unwrap();
 
     session.select("INBOX").await.unwrap();
 
@@ -286,7 +295,10 @@ async fn test_index_metadata_operations() {
         size: 100,
     };
 
-    let path = index.add_message("alice", "INBOX", message.clone()).await.unwrap();
+    let path = index
+        .add_message("alice", "INBOX", message.clone())
+        .await
+        .unwrap();
     assert!(path.contains("alice/INBOX"));
 
     // Get message path by ID
@@ -294,11 +306,17 @@ async fn test_index_metadata_operations() {
     assert_eq!(retrieved_path, Some(path.clone()));
 
     // Get message path by UID
-    let uid_path = index.get_message_path_by_uid("alice", "INBOX", 1).await.unwrap();
+    let uid_path = index
+        .get_message_path_by_uid("alice", "INBOX", 1)
+        .await
+        .unwrap();
     assert_eq!(uid_path, Some(path));
 
     // Search
-    let results = index.search("alice", "INBOX", &SearchQuery::From("bob".to_string())).await.unwrap();
+    let results = index
+        .search("alice", "INBOX", &SearchQuery::From("bob".to_string()))
+        .await
+        .unwrap();
     assert_eq!(results.len(), 1);
 
     // Delete mailbox
@@ -342,21 +360,36 @@ async fn test_userstore_operations() {
     let db_path = tmp_dir.path().join("users.db");
     let user_store = SQLiteUserStore::new(&db_path).await.unwrap();
 
-    user_store.create_user("alice", "password123").await.unwrap();
+    user_store
+        .create_user("alice", "password123")
+        .await
+        .unwrap();
     user_store.create_user("bob", "password456").await.unwrap();
 
     let user = user_store.get_user("alice").await.unwrap();
     assert!(user.is_some());
     assert_eq!(user.unwrap().username, "alice");
 
-    let valid = user_store.verify_password("alice", "password123").await.unwrap();
+    let valid = user_store
+        .verify_password("alice", "password123")
+        .await
+        .unwrap();
     assert!(valid);
 
-    let invalid = user_store.verify_password("alice", "wrongpass").await.unwrap();
+    let invalid = user_store
+        .verify_password("alice", "wrongpass")
+        .await
+        .unwrap();
     assert!(!invalid);
 
-    user_store.update_password("alice", "newpass").await.unwrap();
-    let valid_new = user_store.verify_password("alice", "newpass").await.unwrap();
+    user_store
+        .update_password("alice", "newpass")
+        .await
+        .unwrap();
+    let valid_new = user_store
+        .verify_password("alice", "newpass")
+        .await
+        .unwrap();
     assert!(valid_new);
 
     let users = user_store.list_users().await.unwrap();
@@ -371,7 +404,7 @@ async fn test_userstore_operations() {
 async fn test_authenticator() {
     let tmp_dir = TempDir::new().unwrap();
     let db_path = tmp_dir.path().join("users.db");
-    let user_store = SQLiteUserStore::new(&db_path).await.unwrap();
+    let user_store = Arc::new(SQLiteUserStore::new(&db_path).await.unwrap());
     let authenticator = BasicAuthenticator::new(user_store);
 
     authenticator
@@ -407,7 +440,7 @@ async fn test_full_integration_workflow() {
 
     let mail_store = FilesystemMailStore::new(&mail_dir).await.unwrap();
     let index = InMemoryIndex::new();
-    let user_store = SQLiteUserStore::new(&db_path).await.unwrap();
+    let user_store = Arc::new(SQLiteUserStore::new(&db_path).await.unwrap());
     let authenticator = BasicAuthenticator::new(user_store);
 
     // Create user
@@ -442,7 +475,10 @@ async fn test_full_integration_workflow() {
         size: 100,
     };
 
-    let path = index.add_message("alice", "INBOX", message.clone()).await.unwrap();
+    let path = index
+        .add_message("alice", "INBOX", message.clone())
+        .await
+        .unwrap();
 
     // Store message content in mailstore
     let content = b"From: bob@example.com\r\nTo: alice@example.com\r\nSubject: Important\r\n\r\nThis is important";
@@ -450,7 +486,11 @@ async fn test_full_integration_workflow() {
 
     // Search via index
     let search_results = index
-        .search("alice", "INBOX", &SearchQuery::Subject("Important".to_string()))
+        .search(
+            "alice",
+            "INBOX",
+            &SearchQuery::Subject("Important".to_string()),
+        )
         .await
         .unwrap();
     assert_eq!(search_results.len(), 1);

@@ -3,10 +3,10 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use crate::error::Result;
 use crate::authenticator::Authenticator;
-use crate::userstore::UserStore;
+use crate::error::Result;
 use crate::types::*;
+use crate::userstore::UserStore;
 
 /// Basic authenticator that uses a UserStore for authentication
 pub struct BasicAuthenticator<U: UserStore> {
@@ -14,10 +14,8 @@ pub struct BasicAuthenticator<U: UserStore> {
 }
 
 impl<U: UserStore> BasicAuthenticator<U> {
-    pub fn new(user_store: U) -> Self {
-        Self {
-            user_store: Arc::new(user_store),
-        }
+    pub fn new(user_store: Arc<U>) -> Self {
+        Self { user_store }
     }
 }
 
@@ -44,9 +42,12 @@ mod tests {
     async fn test_authenticate_success() {
         let tmp_dir = TempDir::new().unwrap();
         let db_path = tmp_dir.path().join("users.db");
-        let user_store = SQLiteUserStore::new(db_path).await.unwrap();
+        let user_store = Arc::new(SQLiteUserStore::new(db_path).await.unwrap());
 
-        user_store.create_user("testuser", "password123").await.unwrap();
+        user_store
+            .create_user("testuser", "password123")
+            .await
+            .unwrap();
 
         let authenticator = BasicAuthenticator::new(user_store);
 
@@ -63,9 +64,12 @@ mod tests {
     async fn test_authenticate_failure() {
         let tmp_dir = TempDir::new().unwrap();
         let db_path = tmp_dir.path().join("users.db");
-        let user_store = SQLiteUserStore::new(db_path).await.unwrap();
+        let user_store = Arc::new(SQLiteUserStore::new(db_path).await.unwrap());
 
-        user_store.create_user("testuser", "password123").await.unwrap();
+        user_store
+            .create_user("testuser", "password123")
+            .await
+            .unwrap();
 
         let authenticator = BasicAuthenticator::new(user_store);
 

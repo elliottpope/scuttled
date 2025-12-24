@@ -4,10 +4,11 @@ use scuttled::authenticator::r#impl::BasicAuthenticator;
 use scuttled::index::r#impl::InMemoryIndex;
 use scuttled::mailstore::r#impl::FilesystemMailStore;
 use scuttled::queue::r#impl::ChannelQueue;
-use scuttled::userstore::r#impl::SQLiteUserStore;
 use scuttled::server::ImapServer;
-use scuttled::{Index, MailStore, UserStore};
+use scuttled::userstore::r#impl::SQLiteUserStore;
+use scuttled::{Index, UserStore};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[async_std::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,11 +25,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mail_store = FilesystemMailStore::new(&mail_dir).await?;
     let index = InMemoryIndex::new();
-    let user_store1 = SQLiteUserStore::new(&db_path).await?;
-    let user_store2 = SQLiteUserStore::new(&db_path).await?;
+    let user_store = Arc::new(SQLiteUserStore::new(&db_path).await?);
 
     log::info!("Creating default test user...");
-    if let Err(e) = user_store1.create_user("test", "test").await {
+    if let Err(e) = user_store.create_user("test", "test").await {
         log::warn!("Failed to create test user (may already exist): {}", e);
     }
 
@@ -37,10 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log::warn!("Failed to create INBOX (may already exist): {}", e);
     }
 
-    let authenticator = BasicAuthenticator::new(user_store1);
+    let authenticator = BasicAuthenticator::new(user_store.clone());
     let queue = ChannelQueue::new();
 
-    let server = ImapServer::new(mail_store, index, authenticator, user_store2, queue);
+    let server = ImapServer::new(mail_store, index, authenticator, user_store, queue);
 
     let addr = "127.0.0.1:1143";
     log::info!("Starting IMAP server on {}...", addr);
