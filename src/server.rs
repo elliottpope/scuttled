@@ -8,9 +8,9 @@ use std::collections::HashMap;
 
 use crate::error::Result;
 use crate::protocol::{parse_command, Command, Response};
-use crate::{Authenticator, Index, MailStore, Queue, UserStore, CommandHandler};
 use crate::session_context::{SessionContext, SessionState};
 use crate::types::*;
+use crate::{Authenticator, CommandHandler, Index, MailStore, Queue, UserStore};
 
 /// IMAP server with support for custom command handlers
 pub struct ImapServer {
@@ -28,7 +28,7 @@ impl ImapServer {
         mail_store: M,
         index: I,
         authenticator: A,
-        user_store: U,
+        user_store: Arc<U>,
         queue: Q,
     ) -> Self
     where
@@ -42,7 +42,7 @@ impl ImapServer {
             mail_store: Arc::new(mail_store),
             index: Arc::new(index),
             authenticator: Arc::new(authenticator),
-            user_store: Arc::new(user_store),
+            user_store,
             queue: Arc::new(queue),
             custom_handlers: Arc::new(HashMap::new()),
         }
@@ -105,7 +105,9 @@ impl Session {
     async fn handle(&self, stream: TcpStream) -> Result<()> {
         let mut stream = stream;
 
-        stream.write_all(b"* OK IMAP4rev1 Service Ready\r\n").await?;
+        stream
+            .write_all(b"* OK IMAP4rev1 Service Ready\r\n")
+            .await?;
 
         let reader = BufReader::new(stream.clone());
         let mut lines = reader.lines();
@@ -157,7 +159,9 @@ impl Session {
                 message: "NOOP completed".to_string(),
             },
             Command::Logout => self.handle_logout(tag).await,
-            Command::Login { username, password } => self.handle_login(tag, username, password).await,
+            Command::Login { username, password } => {
+                self.handle_login(tag, username, password).await
+            }
             Command::Select { mailbox } => self.handle_select(tag, mailbox, false).await,
             Command::Examine { mailbox } => self.handle_select(tag, mailbox, true).await,
             Command::Create { mailbox } => self.handle_create(tag, mailbox).await,
@@ -242,13 +246,18 @@ impl Session {
     }
 
     async fn handle_login(&self, tag: &str, username: String, password: String) -> Response {
-        let creds = Credentials { username: username.clone(), password };
+        let creds = Credentials {
+            username: username.clone(),
+            password,
+        };
 
         match self.context.authenticator.authenticate(&creds).await {
             Ok(true) => {
-                self.context.set_state(SessionState::Authenticated {
-                    username: username.clone(),
-                }).await;
+                self.context
+                    .set_state(SessionState::Authenticated {
+                        username: username.clone(),
+                    })
+                    .await;
                 Response::Ok {
                     tag: Some(tag.to_string()),
                     message: format!("{} logged in", username),
@@ -268,18 +277,22 @@ impl Session {
     async fn handle_select(&self, tag: &str, mailbox: String, readonly: bool) -> Response {
         let username = match self.context.get_username().await {
             Some(u) => u,
-            None => return Response::No {
-                tag: Some(tag.to_string()),
-                message: "Not authenticated".to_string(),
-            },
+            None => {
+                return Response::No {
+                    tag: Some(tag.to_string()),
+                    message: "Not authenticated".to_string(),
+                }
+            }
         };
 
         match self.context.index.get_mailbox(&username, &mailbox).await {
             Ok(Some(_mb)) => {
-                self.context.set_state(SessionState::Selected {
-                    username,
-                    mailbox: mailbox.clone(),
-                }).await;
+                self.context
+                    .set_state(SessionState::Selected {
+                        username,
+                        mailbox: mailbox.clone(),
+                    })
+                    .await;
                 self.context.set_selected_mailbox(Some(mailbox)).await;
 
                 let cmd = if readonly { "EXAMINE" } else { "SELECT" };
@@ -302,10 +315,12 @@ impl Session {
     async fn handle_create(&self, tag: &str, mailbox: String) -> Response {
         let username = match self.context.get_username().await {
             Some(u) => u,
-            None => return Response::No {
-                tag: Some(tag.to_string()),
-                message: "Not authenticated".to_string(),
-            },
+            None => {
+                return Response::No {
+                    tag: Some(tag.to_string()),
+                    message: "Not authenticated".to_string(),
+                }
+            }
         };
 
         match self.context.index.create_mailbox(&username, &mailbox).await {
@@ -323,14 +338,21 @@ impl Session {
     async fn handle_delete(&self, tag: &str, mailbox: String) -> Response {
         let username = match self.context.get_username().await {
             Some(u) => u,
-            None => return Response::No {
-                tag: Some(tag.to_string()),
-                message: "Not authenticated".to_string(),
-            },
+            None => {
+                return Response::No {
+                    tag: Some(tag.to_string()),
+                    message: "Not authenticated".to_string(),
+                }
+            }
         };
 
         // Get all message paths for this mailbox
-        match self.context.index.list_message_paths(&username, &mailbox).await {
+        match self
+            .context
+            .index
+            .list_message_paths(&username, &mailbox)
+            .await
+        {
             Ok(paths) => {
                 // Delete all messages from MailStore
                 for path in paths {
@@ -359,10 +381,12 @@ impl Session {
     async fn handle_list(&self, tag: &str, _reference: String, _pattern: String) -> Response {
         let username = match self.context.get_username().await {
             Some(u) => u,
-            None => return Response::No {
-                tag: Some(tag.to_string()),
-                message: "Not authenticated".to_string(),
-            },
+            None => {
+                return Response::No {
+                    tag: Some(tag.to_string()),
+                    message: "Not authenticated".to_string(),
+                }
+            }
         };
 
         match self.context.index.list_mailboxes(&username).await {
@@ -388,7 +412,9 @@ impl Session {
         self.context.set_selected_mailbox(None).await;
 
         if let Some(username) = self.context.get_username().await {
-            self.context.set_state(SessionState::Authenticated { username }).await;
+            self.context
+                .set_state(SessionState::Authenticated { username })
+                .await;
         }
 
         Response::Ok {
