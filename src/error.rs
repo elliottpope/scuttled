@@ -24,6 +24,12 @@ pub enum Error {
     #[error("Invalid mailbox: {0}")]
     InvalidMailbox(String),
 
+    #[error("Mailbox already exists: {0}")]
+    MailboxExists(String),
+
+    #[error("Mailbox not found: {0}")]
+    MailboxNotFound(String),
+
     #[error("Invalid message: {0}")]
     InvalidMessage(String),
 
