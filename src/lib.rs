@@ -14,6 +14,8 @@ pub mod authenticator;
 pub mod userstore;
 pub mod command_handler;
 pub mod session_context;
+pub mod mailboxes;
+pub mod session;
 
 pub use error::{Error, Result};
 pub use types::*;
@@ -24,6 +26,7 @@ pub use authenticator::Authenticator;
 pub use userstore::UserStore;
 pub use command_handler::CommandHandler;
 pub use session_context::{SessionContext, SessionState};
+pub use mailboxes::{Mailboxes, MailboxInfo};
 
 #[cfg(test)]
 mod tests;

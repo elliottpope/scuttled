@@ -20,6 +20,13 @@ impl Default for MessageId {
     }
 }
 
+/// Unique identifier for a mailbox
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MailboxId {
+    pub username: Username,
+    pub name: MailboxName,
+}
+
 /// Message UID (unique within a mailbox)
 pub type Uid = u32;
 
