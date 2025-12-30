@@ -6,6 +6,7 @@
 pub mod error;
 pub mod types;
 pub mod protocol;
+pub mod connection;
 pub mod server;
 pub mod mailstore;
 pub mod index;

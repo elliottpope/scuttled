@@ -3,12 +3,13 @@
 use scuttled::authenticator::r#impl::BasicAuthenticator;
 use scuttled::index::r#impl::InMemoryIndex;
 use scuttled::index::IndexedMessage;
+use scuttled::mailboxes::r#impl::InMemoryMailboxes;
 use scuttled::mailstore::r#impl::FilesystemMailStore;
 use scuttled::queue::r#impl::ChannelQueue;
 use scuttled::server::ImapServer;
 use scuttled::types::*;
 use scuttled::userstore::r#impl::SQLiteUserStore;
-use scuttled::{Authenticator, Index, MailStore, Queue, UserStore};
+use scuttled::{Authenticator, Index, MailStore, Queue, UserStore, Mailboxes};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -26,6 +27,7 @@ async fn setup_test_server() -> (TempDir, String) {
     let index = InMemoryIndex::new();
     let user_store = Arc::new(SQLiteUserStore::new(&db_path).await.unwrap());
     let queue = ChannelQueue::new();
+    let mailboxes = InMemoryMailboxes::new();
 
     // Set up test user and mailbox
     user_store
@@ -35,7 +37,7 @@ async fn setup_test_server() -> (TempDir, String) {
     index.create_mailbox("testuser", "INBOX").await.unwrap();
 
     let authenticator = BasicAuthenticator::new(user_store);
-    let server = ImapServer::new(mail_store, index, authenticator, user_store, queue);
+    let server = ImapServer::new(mail_store, index, authenticator, user_store, queue, mailboxes);
 
     // Bind to a random port
     let addr = "127.0.0.1:0";
@@ -59,7 +61,7 @@ async fn setup_test_server() -> (TempDir, String) {
 async fn test_imap_capability() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let capabilities = client.capabilities().await.unwrap();
 
@@ -70,7 +72,7 @@ async fn test_imap_capability() {
 async fn test_imap_login() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -81,7 +83,7 @@ async fn test_imap_login() {
 async fn test_imap_login_failure() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let result = client.login("testuser", "wrongpass").await;
 
@@ -92,7 +94,7 @@ async fn test_imap_login_failure() {
 async fn test_imap_select_mailbox() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -106,7 +108,7 @@ async fn test_imap_select_mailbox() {
 async fn test_imap_create_mailbox() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -124,7 +126,7 @@ async fn test_imap_create_mailbox() {
 async fn test_imap_list_mailboxes() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -142,7 +144,7 @@ async fn test_imap_list_mailboxes() {
 async fn test_imap_delete_mailbox() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -161,7 +163,7 @@ async fn test_imap_delete_mailbox() {
 async fn test_imap_append_message() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -181,7 +183,7 @@ async fn test_imap_append_message() {
 async fn test_imap_fetch_message() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -206,7 +208,7 @@ async fn test_imap_fetch_message() {
 async fn test_imap_expunge() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 

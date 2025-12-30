@@ -9,6 +9,7 @@ pub enum Command {
     Capability,
     Noop,
     Logout,
+    Starttls,
     Login { username: String, password: String },
     Select { mailbox: String },
     Examine { mailbox: String },
@@ -94,6 +95,7 @@ pub fn parse_command(_tag: &str, line: &str) -> Result<Command> {
         "CAPABILITY" => Ok(Command::Capability),
         "NOOP" => Ok(Command::Noop),
         "LOGOUT" => Ok(Command::Logout),
+        "STARTTLS" => Ok(Command::Starttls),
         "LOGIN" => {
             if parts.len() < 3 {
                 return Err(Error::ProtocolError("LOGIN requires username and password".to_string()));
@@ -169,6 +171,12 @@ mod tests {
     fn test_parse_capability() {
         let cmd = parse_command("A001", "CAPABILITY").unwrap();
         assert_eq!(cmd, Command::Capability);
+    }
+
+    #[test]
+    fn test_parse_starttls() {
+        let cmd = parse_command("A001", "STARTTLS").unwrap();
+        assert_eq!(cmd, Command::Starttls);
     }
 
     #[test]

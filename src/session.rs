@@ -4,12 +4,13 @@
 
 use std::collections::{HashSet, HashMap};
 use std::time::{Duration, Instant};
-use async_std::net::TcpStream;
 use async_std::prelude::*;
 use async_std::io::BufReader;
 use async_std::sync::{Arc, RwLock};
+use async_native_tls::TlsAcceptor;
 
 use crate::error::{Error, Result};
+use crate::connection::Connection;
 use crate::protocol::{parse_command, Command, Response};
 use crate::types::*;
 use crate::{Authenticator, Index, MailStore, Queue, UserStore, CommandHandler, Mailboxes};
@@ -155,103 +156,164 @@ impl Session {
         }
     }
 
-    /// Handle the session by processing commands from the TcpStream
-    pub async fn handle(mut self, stream: TcpStream) -> Result<()> {
-        let peer_addr = stream.peer_addr().ok();
+    /// Handle the session by processing commands from the connection
+    pub async fn handle(mut self, mut connection: Connection, tls_acceptor: Option<Arc<TlsAcceptor>>) -> Result<()> {
+        let peer_addr = connection.peer_addr().ok();
 
         // Send greeting
         let greeting = Response::Ok {
             tag: None,
             message: "IMAP server ready".to_string(),
         };
-        if let Err(e) = self.send_response(&stream, &greeting).await {
+        if let Err(e) = self.send_response(&connection, &greeting).await {
             eprintln!("Failed to send greeting: {}", e);
             return Err(e);
         }
 
-        let reader = BufReader::new(&stream);
-        let mut lines = reader.lines();
+        // Main command processing loop
+        'outer: loop {
+            // Create a new reader for this phase (needed to support STARTTLS upgrade)
+            let reader = BufReader::new(&connection);
+            let mut lines = reader.lines();
+            let mut should_continue = false;
 
-        while let Some(line) = lines.next().await {
-            self.last_client_interaction = Instant::now();
+            while let Some(line) = lines.next().await {
+                self.last_client_interaction = Instant::now();
 
-            // Check session timeouts
-            if self.session_started.elapsed() > self.max_session_duration {
-                let _ = self.send_response(&stream, &Response::Bye {
-                    message: "Session duration exceeded".to_string(),
-                }).await;
-                return Err(Error::ProtocolError("Session duration exceeded".to_string()));
-            }
-
-            if self.last_client_interaction.elapsed() > self.max_idle_duration {
-                let _ = self.send_response(&stream, &Response::Bye {
-                    message: "Session idle timeout".to_string(),
-                }).await;
-                return Err(Error::ProtocolError("Session idle timeout".to_string()));
-            }
-
-            let line = match line {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("Error reading line from {:?}: {}", peer_addr, e);
-                    break;
-                }
-            };
-
-            // Parse tag and command
-            let parts: Vec<&str> = line.splitn(2, ' ').collect();
-            if parts.len() < 2 {
-                let _ = self.send_response(&stream, &Response::Bad {
-                    tag: None,
-                    message: "Invalid command format".to_string(),
-                }).await;
-                continue;
-            }
-
-            let tag = parts[0].to_string();
-            let command_line = parts[1];
-
-            // Register tag
-            if let Err(e) = self.tag_history.register(tag.clone()) {
-                let _ = self.send_response(&stream, &Response::Bad {
-                    tag: Some(tag),
-                    message: format!("Tag error: {}", e),
-                }).await;
-                continue;
-            }
-
-            // Parse and handle command
-            match parse_command(&tag, command_line) {
-                Ok(command) => {
-                    let response = self.handle_command(&tag, command).await;
-                    if let Err(e) = self.send_response(&stream, &response).await {
-                        eprintln!("Error sending response: {}", e);
-                        break;
-                    }
-
-                    // Check for LOGOUT
-                    if matches!(response, Response::Bye { .. }) {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let _ = self.send_response(&stream, &Response::Bad {
-                        tag: Some(tag),
-                        message: format!("Parse error: {}", e),
+                // Check session timeouts
+                if self.session_started.elapsed() > self.max_session_duration {
+                    let _ = self.send_response(&connection, &Response::Bye {
+                        message: "Session duration exceeded".to_string(),
                     }).await;
+                    return Err(Error::ProtocolError("Session duration exceeded".to_string()));
                 }
+
+                if self.last_client_interaction.elapsed() > self.max_idle_duration {
+                    let _ = self.send_response(&connection, &Response::Bye {
+                        message: "Session idle timeout".to_string(),
+                    }).await;
+                    return Err(Error::ProtocolError("Session idle timeout".to_string()));
+                }
+
+                let line = match line {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("Error reading line from {:?}: {}", peer_addr, e);
+                        return Ok(());
+                    }
+                };
+
+                // Parse tag and command
+                let parts: Vec<&str> = line.splitn(2, ' ').collect();
+                if parts.len() < 2 {
+                    let _ = self.send_response(&connection, &Response::Bad {
+                        tag: None,
+                        message: "Invalid command format".to_string(),
+                    }).await;
+                    continue;
+                }
+
+                let tag = parts[0].to_string();
+                let command_line = parts[1];
+
+                // Register tag
+                if let Err(e) = self.tag_history.register(tag.clone()) {
+                    let _ = self.send_response(&connection, &Response::Bad {
+                        tag: Some(tag),
+                        message: format!("Tag error: {}", e),
+                    }).await;
+                    continue;
+                }
+
+                // Parse command
+                let command = match parse_command(&tag, command_line) {
+                    Ok(cmd) => cmd,
+                    Err(e) => {
+                        let _ = self.send_response(&connection, &Response::Bad {
+                            tag: Some(tag),
+                            message: format!("Parse error: {}", e),
+                        }).await;
+                        continue;
+                    }
+                };
+
+                // Handle STARTTLS specially - needs to upgrade connection
+                if matches!(command, Command::Starttls) {
+                    let response = if connection.is_tls() {
+                        Response::Bad {
+                            tag: Some(tag.clone()),
+                            message: "Already using TLS".to_string(),
+                        }
+                    } else if tls_acceptor.is_none() {
+                        Response::Bad {
+                            tag: Some(tag.clone()),
+                            message: "STARTTLS not available".to_string(),
+                        }
+                    } else {
+                        Response::Ok {
+                            tag: Some(tag.clone()),
+                            message: "Ready for TLS handshake".to_string(),
+                        }
+                    };
+
+                    if let Err(e) = self.send_response(&connection, &response).await {
+                        eprintln!("Error sending STARTTLS response: {}", e);
+                        return Ok(());
+                    }
+
+                    // If we sent OK, upgrade the connection
+                    if matches!(response, Response::Ok { .. }) {
+                        // Drop the lines iterator to release the connection
+                        drop(lines);
+
+                        // Upgrade to TLS
+                        connection = connection.upgrade_to_tls(tls_acceptor.as_ref().unwrap()).await?;
+                        log::info!("Connection upgraded to TLS for {:?}", peer_addr);
+
+                        // Mark that we should continue with the upgraded connection
+                        should_continue = true;
+
+                        // Break inner loop to recreate reader with upgraded connection
+                        break;
+                    }
+
+                    continue;
+                }
+
+                // Handle all other commands normally
+                let response = self.handle_command(&tag, command, connection.is_tls()).await;
+                if let Err(e) = self.send_response(&connection, &response).await {
+                    eprintln!("Error sending response: {}", e);
+                    return Ok(());
+                }
+
+                // Check for LOGOUT
+                if matches!(response, Response::Bye { .. }) {
+                    return Ok(());
+                }
+            }
+
+            // If should_continue is true, we upgraded to TLS and need to continue
+            // Otherwise, the connection closed naturally
+            if !should_continue {
+                return Ok(());
             }
         }
-
-        Ok(())
     }
 
     /// Handle a parsed command
-    async fn handle_command(&mut self, tag: &str, command: Command) -> Response {
+    async fn handle_command(&mut self, tag: &str, command: Command, is_tls: bool) -> Response {
         match command {
-            Command::Capability => self.handle_capability(tag).await,
+            Command::Capability => self.handle_capability(tag, is_tls).await,
             Command::Noop => self.handle_noop(tag).await,
             Command::Logout => self.handle_logout(tag).await,
+            Command::Starttls => {
+                // STARTTLS is handled specially in the main loop, shouldn't reach here
+                Response::Bad {
+                    tag: Some(tag.to_string()),
+                    message: "STARTTLS handling error".to_string(),
+                }
+            }
             Command::Login { username, password } => {
                 self.handle_login(tag, &username, &password).await
             }
@@ -269,10 +331,17 @@ impl Session {
         }
     }
 
-    async fn handle_capability(&self, tag: &str) -> Response {
+    async fn handle_capability(&self, tag: &str, is_tls: bool) -> Response {
+        let mut capabilities = vec!["IMAP4rev1"];
+
+        // Only advertise STARTTLS on non-TLS connections
+        if !is_tls {
+            capabilities.push("STARTTLS");
+        }
+
         Response::Ok {
             tag: Some(tag.to_string()),
-            message: "CAPABILITY IMAP4rev1".to_string(),
+            message: format!("CAPABILITY {}", capabilities.join(" ")),
         }
     }
 
@@ -504,10 +573,9 @@ impl Session {
         }
     }
 
-    async fn send_response(&self, stream: &TcpStream, response: &Response) -> Result<()> {
+    async fn send_response(&self, connection: &Connection, response: &Response) -> Result<()> {
         let response_str = response.to_string();
-        (&*stream).write_all(response_str.as_bytes()).await?;
-        (&*stream).write_all(b"\r\n").await?;
+        (&*connection).write_all(response_str.as_bytes()).await?;
         Ok(())
     }
 }

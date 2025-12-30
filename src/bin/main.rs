@@ -3,6 +3,7 @@
 use scuttled::authenticator::r#impl::BasicAuthenticator;
 use scuttled::index::r#impl::InMemoryIndex;
 use scuttled::mailstore::r#impl::FilesystemMailStore;
+use scuttled::mailboxes::r#impl::InMemoryMailboxes;
 use scuttled::queue::r#impl::ChannelQueue;
 use scuttled::server::ImapServer;
 use scuttled::userstore::r#impl::SQLiteUserStore;
@@ -39,8 +40,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let authenticator = BasicAuthenticator::new(user_store.clone());
     let queue = ChannelQueue::new();
+    let mailboxes = InMemoryMailboxes::new();
 
-    let server = ImapServer::new(mail_store, index, authenticator, user_store, queue);
+    let server = ImapServer::new(mail_store, index, authenticator, user_store, queue, mailboxes);
 
     let addr = "127.0.0.1:1143";
     log::info!("Starting IMAP server on {}...", addr);
