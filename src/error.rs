@@ -48,6 +48,9 @@ pub enum Error {
     #[error("Queue error: {0}")]
     QueueError(String),
 
+    #[error("TLS error: {0}")]
+    TlsError(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 }

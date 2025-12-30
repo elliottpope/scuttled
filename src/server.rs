@@ -3,10 +3,12 @@
 use async_std::net::TcpListener;
 use async_std::prelude::*;
 use async_std::sync::Arc;
+use async_native_tls::TlsAcceptor;
 use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::error::Result;
+use crate::connection::Connection;
 use crate::{Authenticator, Index, MailStore, Queue, UserStore, CommandHandler, Mailboxes};
 use crate::session::Session;
 
@@ -24,6 +26,7 @@ pub struct ImapServer {
     custom_handlers: Arc<HashMap<String, Arc<dyn CommandHandler>>>,
     max_session_duration: Duration,
     max_idle_duration: Duration,
+    tls_acceptor: Option<Arc<TlsAcceptor>>,
 }
 
 impl ImapServer {
@@ -55,6 +58,7 @@ impl ImapServer {
             custom_handlers: Arc::new(HashMap::new()),
             max_session_duration: DEFAULT_MAX_SESSION_DURATION,
             max_idle_duration: DEFAULT_MAX_IDLE_DURATION,
+            tls_acceptor: None,
         }
     }
 
@@ -68,6 +72,33 @@ impl ImapServer {
     pub fn with_max_idle_duration(mut self, duration: Duration) -> Self {
         self.max_idle_duration = duration;
         self
+    }
+
+    /// Enable TLS with the given identity
+    ///
+    /// This enables both implicit TLS (via `listen_tls()`) and STARTTLS support
+    /// (via `listen()` with STARTTLS command).
+    ///
+    /// # Arguments
+    ///
+    /// * `identity` - A native_tls::Identity containing the certificate and private key
+    pub fn with_tls_identity(mut self, identity: native_tls::Identity) -> Result<Self> {
+        let acceptor = native_tls::TlsAcceptor::new(identity)
+            .map_err(|e| crate::error::Error::TlsError(format!("Failed to create TLS acceptor: {}", e)))?;
+        self.tls_acceptor = Some(Arc::new(TlsAcceptor::from(acceptor)));
+        Ok(self)
+    }
+
+    /// Enable TLS with certificate and key from PEM files
+    ///
+    /// # Arguments
+    ///
+    /// * `cert_pem` - PEM-encoded certificate
+    /// * `key_pem` - PEM-encoded private key
+    pub fn with_tls_pem(self, cert_pem: &[u8], key_pem: &[u8]) -> Result<Self> {
+        let identity = native_tls::Identity::from_pkcs8(cert_pem, key_pem)
+            .map_err(|e| crate::error::Error::TlsError(format!("Failed to create identity from PEM: {}", e)))?;
+        self.with_tls_identity(identity)
     }
 
     /// Register a custom command handler
@@ -105,11 +136,51 @@ impl ImapServer {
         let mut incoming = listener.incoming();
         while let Some(stream) = incoming.next().await {
             let stream = stream?;
+            let connection = Connection::plain(stream);
 
             let session = self.new_session();
+            let tls_acceptor = self.tls_acceptor.as_ref().map(Arc::clone);
 
             async_std::task::spawn(async move {
-                if let Err(e) = session.handle(stream).await {
+                if let Err(e) = session.handle(connection, tls_acceptor).await {
+                    log::error!("Session error: {}", e);
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Start the IMAP server on the specified address with implicit TLS
+    ///
+    /// This method listens on the given address and immediately wraps all
+    /// incoming connections with TLS (typically used on port 993).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if TLS is not configured via `with_tls_identity()` or `with_tls_pem()`
+    pub async fn listen_tls(&self, addr: &str) -> Result<()> {
+        let acceptor = self.tls_acceptor.as_ref()
+            .ok_or_else(|| crate::error::Error::TlsError("TLS not configured. Call with_tls_identity() or with_tls_pem() first.".to_string()))?;
+
+        let listener = TcpListener::bind(addr).await?;
+        log::info!("IMAP server listening on {} (implicit TLS)", addr);
+
+        let mut incoming = listener.incoming();
+        while let Some(stream) = incoming.next().await {
+            let stream = stream?;
+
+            // Perform TLS handshake immediately
+            let tls_stream = acceptor.accept(stream).await
+                .map_err(|e| crate::error::Error::TlsError(format!("TLS handshake failed: {}", e)))?;
+
+            let connection = Connection::tls(tls_stream);
+
+            let session = self.new_session();
+            let tls_acceptor = Some(Arc::clone(acceptor));
+
+            async_std::task::spawn(async move {
+                if let Err(e) = session.handle(connection, tls_acceptor).await {
                     log::error!("Session error: {}", e);
                 }
             });
