@@ -5,8 +5,11 @@
 
 use async_trait::async_trait;
 use crate::error::Result;
+use crate::types::MessageId;
+use std::path::PathBuf;
 
 pub mod r#impl;
+pub mod watcher;
 
 /// Trait for storing raw email messages
 #[async_trait]
@@ -24,5 +27,41 @@ pub trait MailStore: Send + Sync {
     async fn exists(&self, path: &str) -> Result<bool>;
 
     /// Shutdown the mailstore gracefully
+    async fn shutdown(&self) -> Result<()>;
+}
+
+/// Events that can occur in the mail store
+#[derive(Debug, Clone)]
+pub enum MailStoreEvent {
+    /// A new message was added
+    MessageCreated {
+        username: String,
+        mailbox: String,
+        path: PathBuf,
+        content: Vec<u8>,
+    },
+    /// A message was modified (e.g., flags changed in Maildir)
+    MessageModified {
+        message_id: MessageId,
+        old_path: PathBuf,
+        new_path: PathBuf,
+    },
+    /// A message was deleted
+    MessageDeleted {
+        message_id: MessageId,
+        path: PathBuf,
+    },
+}
+
+/// Trait for watching changes to the mail store
+#[async_trait]
+pub trait MailStoreWatcher: Send + Sync {
+    /// Start watching a mailbox directory for changes
+    async fn watch_mailbox(&self, username: &str, mailbox: &str) -> Result<()>;
+
+    /// Stop watching a mailbox directory
+    async fn unwatch_mailbox(&self, username: &str, mailbox: &str) -> Result<()>;
+
+    /// Shutdown the watcher gracefully
     async fn shutdown(&self) -> Result<()>;
 }
