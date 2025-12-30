@@ -143,7 +143,6 @@ mod tests {
     use super::*;
     use async_std::net::{TcpListener, TcpStream};
     use async_std::prelude::*;
-    use native_tls::Identity;
 
     async fn create_test_connection() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
