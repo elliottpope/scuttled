@@ -16,6 +16,7 @@ const DEFAULT_MAX_SESSION_DURATION: Duration = Duration::from_secs(3600); // 1 h
 const DEFAULT_MAX_IDLE_DURATION: Duration = Duration::from_secs(1800); // 30 minutes
 
 /// IMAP server with support for custom command handlers
+#[derive(Clone)]
 pub struct ImapServer {
     mail_store: Arc<dyn MailStore>,
     index: Arc<dyn Index>,
