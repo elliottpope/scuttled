@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Default credentials: username=test, password=test");
 
     // Set up signal handling for graceful shutdown
-    let signals = Signals::new(&[SIGTERM, SIGINT, SIGHUP])?;
+    let signals = Signals::new([SIGTERM, SIGINT, SIGHUP])?;
     let handle = signals.handle();
 
     // Clone server for concurrent use
@@ -107,7 +107,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SIGHUP => "SIGHUP",
             _ => "unknown signal",
         };
-        log::info!("Received {} signal, initiating graceful shutdown...", signal_name);
+        log::info!(
+            "Received {} signal, initiating graceful shutdown...",
+            signal_name
+        );
     }
 
     // Clean up signal handler
