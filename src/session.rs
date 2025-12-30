@@ -171,7 +171,7 @@ impl Session {
         }
 
         // Main command processing loop
-        'outer: loop {
+        loop {
             // Create a new reader for this phase (needed to support STARTTLS upgrade)
             let reader = BufReader::new(&connection);
             let mut lines = reader.lines();

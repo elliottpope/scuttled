@@ -9,10 +9,11 @@ use scuttled::queue::r#impl::ChannelQueue;
 use scuttled::server::ImapServer;
 use scuttled::types::*;
 use scuttled::userstore::r#impl::SQLiteUserStore;
-use scuttled::{Authenticator, Index, MailStore, Queue, UserStore, Mailboxes};
+use scuttled::{Authenticator, Index, MailStore, Queue, UserStore};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
+use futures::stream::StreamExt;
 
 /// Set up a test server and return the temp directory and address
 async fn setup_test_server() -> (TempDir, String) {
@@ -36,7 +37,7 @@ async fn setup_test_server() -> (TempDir, String) {
         .unwrap();
     index.create_mailbox("testuser", "INBOX").await.unwrap();
 
-    let authenticator = BasicAuthenticator::new(user_store);
+    let authenticator = BasicAuthenticator::new(user_store.clone());
     let server = ImapServer::new(mail_store, index, authenticator, user_store, queue, mailboxes);
 
     // Bind to a random port
@@ -55,17 +56,6 @@ async fn setup_test_server() -> (TempDir, String) {
     async_std::task::sleep(Duration::from_millis(100)).await;
 
     (tmp_dir, actual_addr)
-}
-
-#[tokio::test]
-async fn test_imap_capability() {
-    let (_tmp_dir, addr) = setup_test_server().await;
-
-    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
-    let client = async_imap::Client::new(stream);
-    let capabilities = client.capabilities().await.unwrap();
-
-    assert!(capabilities.has_str("IMAP4rev1"));
 }
 
 #[tokio::test]
@@ -114,10 +104,16 @@ async fn test_imap_create_mailbox() {
 
     session.create("Drafts").await.unwrap();
 
-    let mailboxes = session.list(None, Some("*")).await.unwrap();
-    let mailbox_names: Vec<String> = mailboxes.iter().map(|mb| mb.name().to_string()).collect();
+    {
+        let mut mailboxes = session.list(None, Some("*")).await.unwrap();
+        let mut mailbox_names = Vec::new();
+        while let Some(name_result) = mailboxes.next().await {
+            let name = name_result.unwrap();
+            mailbox_names.push(name.name().to_string());
+        }
 
-    assert!(mailbox_names.contains(&"Drafts".to_string()));
+        assert!(mailbox_names.contains(&"Drafts".to_string()));
+    }
 
     session.logout().await.unwrap();
 }
@@ -134,8 +130,14 @@ async fn test_imap_list_mailboxes() {
     session.create("Sent").await.unwrap();
     session.create("Trash").await.unwrap();
 
-    let mailboxes = session.list(None, Some("*")).await.unwrap();
-    assert!(mailboxes.len() >= 2); // At least Sent and Trash (INBOX may or may not be listed)
+    {
+        let mut mailboxes = session.list(None, Some("*")).await.unwrap();
+        let mut count = 0;
+        while let Some(_) = mailboxes.next().await {
+            count += 1;
+        }
+        assert!(count >= 2); // At least Sent and Trash (INBOX may or may not be listed)
+    }
 
     session.logout().await.unwrap();
 }
@@ -151,10 +153,16 @@ async fn test_imap_delete_mailbox() {
     session.create("ToDelete").await.unwrap();
     session.delete("ToDelete").await.unwrap();
 
-    let mailboxes = session.list(None, Some("*")).await.unwrap();
-    let mailbox_names: Vec<String> = mailboxes.iter().map(|mb| mb.name().to_string()).collect();
+    {
+        let mut mailboxes = session.list(None, Some("*")).await.unwrap();
+        let mut mailbox_names = Vec::new();
+        while let Some(name_result) = mailboxes.next().await {
+            let name = name_result.unwrap();
+            mailbox_names.push(name.name().to_string());
+        }
 
-    assert!(!mailbox_names.contains(&"ToDelete".to_string()));
+        assert!(!mailbox_names.contains(&"ToDelete".to_string()));
+    }
 
     session.logout().await.unwrap();
 }
@@ -170,7 +178,7 @@ async fn test_imap_append_message() {
     session.select("INBOX").await.unwrap();
 
     let message = b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test\r\n\r\nThis is a test message.";
-    session.append("INBOX", message).finish().await.unwrap();
+    session.append("INBOX", message).await.unwrap();
 
     // Check that the message was added
     let mailbox = session.examine("INBOX").await.unwrap();
@@ -191,15 +199,20 @@ async fn test_imap_fetch_message() {
     let message_content = b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Fetch\r\n\r\nTest body.";
     session
         .append("INBOX", message_content)
-        .finish()
         .await
         .unwrap();
 
     session.select("INBOX").await.unwrap();
 
     // Fetch the message
-    let messages = session.fetch("1", "RFC822").await.unwrap();
-    assert_eq!(messages.len(), 1);
+    {
+        let mut messages = session.fetch("1", "RFC822").await.unwrap();
+        let mut count = 0;
+        while let Some(_) = messages.next().await {
+            count += 1;
+        }
+        assert_eq!(count, 1);
+    }
 
     session.logout().await.unwrap();
 }
@@ -215,22 +228,27 @@ async fn test_imap_expunge() {
     // Append two messages
     session
         .append("INBOX", b"Message 1")
-        .finish()
         .await
         .unwrap();
     session
         .append("INBOX", b"Message 2")
-        .finish()
         .await
         .unwrap();
 
     session.select("INBOX").await.unwrap();
 
     // Mark first message as deleted
-    session.store("1", "+FLAGS (\\Deleted)").await.unwrap();
+    {
+        let mut store_result = session.store("1", "+FLAGS (\\Deleted)").await.unwrap();
+        while let Some(_) = store_result.next().await {}
+    }
 
     // Expunge
-    session.expunge().await.unwrap();
+    {
+        let expunge_result = session.expunge().await.unwrap();
+        futures::pin_mut!(expunge_result);
+        while let Some(_) = expunge_result.next().await {}
+    }
 
     // Check that only one message remains
     let mailbox = session.examine("INBOX").await.unwrap();

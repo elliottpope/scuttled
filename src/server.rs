@@ -188,4 +188,38 @@ impl ImapServer {
 
         Ok(())
     }
+
+    /// Listen on an existing TcpListener with implicit TLS (useful for testing)
+    ///
+    /// This method accepts incoming connections and immediately wraps them with TLS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if TLS is not configured via `with_tls_identity()` or `with_tls_pem()`
+    pub async fn listen_on_tls(&self, listener: TcpListener) -> Result<()> {
+        let acceptor = self.tls_acceptor.as_ref()
+            .ok_or_else(|| crate::error::Error::TlsError("TLS not configured. Call with_tls_identity() or with_tls_pem() first.".to_string()))?;
+
+        let mut incoming = listener.incoming();
+        while let Some(stream) = incoming.next().await {
+            let stream = stream?;
+
+            // Perform TLS handshake immediately
+            let tls_stream = acceptor.accept(stream).await
+                .map_err(|e| crate::error::Error::TlsError(format!("TLS handshake failed: {}", e)))?;
+
+            let connection = Connection::tls(tls_stream);
+
+            let session = self.new_session();
+            let tls_acceptor = Some(Arc::clone(acceptor));
+
+            async_std::task::spawn(async move {
+                if let Err(e) = session.handle(connection, tls_acceptor).await {
+                    log::error!("Session error: {}", e);
+                }
+            });
+        }
+
+        Ok(())
+    }
 }
