@@ -1,4 +1,4 @@
-//! Maildir format parsing and utilities
+//! Maildir format implementation
 //!
 //! Maildir is a common mail storage format where messages are stored as individual files.
 //! The format uses three directories:
@@ -15,128 +15,130 @@
 //! - S = Seen
 //! - T = Deleted (marked for deletion)
 
+use crate::mailstore::format::{MailboxFormat, ParsedMessage};
 use crate::types::MessageFlag;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Parsed Maildir message information
-#[derive(Debug, Clone)]
-pub struct MaildirMessage {
-    /// The unique identifier (before the colon)
-    pub unique_id: String,
-    /// The flags extracted from the filename
-    pub flags: Vec<MessageFlag>,
-    /// Whether this message is in the 'new' or 'cur' directory
-    pub is_new: bool,
-    /// Full path to the message file
-    pub path: PathBuf,
-}
+/// Maildir format parser
+pub struct MaildirFormat;
 
-/// Parse a Maildir filename to extract flags
-///
-/// Maildir filenames have the format: `<unique-id>:2,<flags>`
-/// For example: `1234567890.M123P456.hostname:2,RS` means Replied and Seen
-pub fn parse_maildir_filename(path: &Path) -> Option<MaildirMessage> {
-    let filename = path.file_name()?.to_str()?;
-    let parent = path.parent()?;
-    let parent_name = parent.file_name()?.to_str()?;
+impl MaildirFormat {
+    pub fn new() -> Self {
+        Self
+    }
 
-    // Determine if message is in 'new' or 'cur' directory
-    let is_new = parent_name == "new";
+    /// Parse Maildir flag characters into MessageFlag objects
+    fn parse_flags(flags_str: &str) -> Vec<MessageFlag> {
+        let mut flags = Vec::new();
 
-    // Split filename at colon to get unique_id and flags
-    let (unique_id, flags_str) = if let Some(colon_idx) = filename.find(':') {
-        let (id, rest) = filename.split_at(colon_idx);
-        // Check for ":2," which indicates the start of flags
-        if rest.starts_with(":2,") {
-            (id.to_string(), &rest[3..])
-        } else {
-            (id.to_string(), "")
+        for ch in flags_str.chars() {
+            let flag = match ch {
+                'D' => MessageFlag::Draft,
+                'F' => MessageFlag::Flagged,
+                'R' => MessageFlag::Answered, // R = Replied
+                'S' => MessageFlag::Seen,
+                'T' => MessageFlag::Deleted, // T = Trashed
+                _ => continue,               // Ignore unknown flags
+            };
+            flags.push(flag);
         }
-    } else {
-        // No flags in filename
-        (filename.to_string(), "")
-    };
 
-    let flags = parse_maildir_flags(flags_str);
-
-    Some(MaildirMessage {
-        unique_id,
-        flags,
-        is_new,
-        path: path.to_path_buf(),
-    })
+        flags
+    }
 }
 
-/// Parse Maildir flag characters into MessageFlag objects
-fn parse_maildir_flags(flags_str: &str) -> Vec<MessageFlag> {
-    let mut flags = Vec::new();
+impl MailboxFormat for MaildirFormat {
+    fn parse_message_path(&self, path: &Path, root: &Path) -> Option<ParsedMessage> {
+        // Extract relative path from root
+        let relative = path.strip_prefix(root).ok()?;
+        let components: Vec<_> = relative.components().collect();
 
-    for ch in flags_str.chars() {
-        let flag = match ch {
-            'D' => MessageFlag::Draft,
-            'F' => MessageFlag::Flagged,
-            'R' => MessageFlag::Answered,  // R = Replied
-            'S' => MessageFlag::Seen,
-            'T' => MessageFlag::Deleted,   // T = Trashed
-            _ => continue,  // Ignore unknown flags
+        // Need at least username/mailbox/subdir/filename
+        if components.len() < 4 {
+            return None;
+        }
+
+        let username = components[0].as_os_str().to_str()?.to_string();
+        let mailbox = components[1].as_os_str().to_str()?.to_string();
+        let subdir = components[2].as_os_str().to_str()?;
+
+        // Only process messages in 'new' or 'cur', not 'tmp'
+        let is_new = match subdir {
+            "new" => true,
+            "cur" => false,
+            _ => return None, // Ignore tmp and other directories
         };
-        flags.push(flag);
+
+        // Parse the filename
+        let filename = path.file_name()?.to_str()?;
+
+        // Split filename at colon to get unique_id and flags
+        let (unique_id, flags) = if let Some(colon_idx) = filename.find(':') {
+            let (id, rest) = filename.split_at(colon_idx);
+            // Check for ":2," which indicates the start of flags
+            if rest.starts_with(":2,") {
+                (id.to_string(), Self::parse_flags(&rest[3..]))
+            } else {
+                (id.to_string(), Vec::new())
+            }
+        } else {
+            // No flags in filename
+            (filename.to_string(), Vec::new())
+        };
+
+        Some(ParsedMessage {
+            unique_id,
+            flags,
+            is_new,
+            username,
+            mailbox,
+        })
     }
 
-    // Messages in 'cur' directory without 'S' flag might still be unseen
-    // Messages in 'new' directory are always unseen (no 'S' flag)
+    fn watch_subdirectories(&self) -> Vec<&'static str> {
+        vec!["new", "cur"]
+    }
 
-    flags
-}
+    fn flags_to_filename_component(&self, flags: &[MessageFlag]) -> String {
+        let mut chars: Vec<char> = Vec::new();
 
-/// Convert MessageFlag objects back to Maildir flag characters
-pub fn flags_to_maildir_string(flags: &[MessageFlag]) -> String {
-    let mut chars: Vec<char> = Vec::new();
+        for flag in flags {
+            match flag {
+                MessageFlag::Draft => chars.push('D'),
+                MessageFlag::Flagged => chars.push('F'),
+                MessageFlag::Answered => chars.push('R'),
+                MessageFlag::Seen => chars.push('S'),
+                MessageFlag::Deleted => chars.push('T'),
+                MessageFlag::Recent => {}          // Recent is not stored in Maildir
+                MessageFlag::Custom(_) => {}       // Custom flags not supported in standard Maildir
+            }
+        }
 
-    for flag in flags {
-        match flag {
-            MessageFlag::Draft => chars.push('D'),
-            MessageFlag::Flagged => chars.push('F'),
-            MessageFlag::Answered => chars.push('R'),
-            MessageFlag::Seen => chars.push('S'),
-            MessageFlag::Deleted => chars.push('T'),
-            MessageFlag::Recent => {}, // Recent is not stored in Maildir
-            MessageFlag::Custom(_) => {}, // Custom flags not supported in standard Maildir
+        // Sort flags alphabetically (Maildir convention)
+        chars.sort_unstable();
+
+        if chars.is_empty() {
+            String::new()
+        } else {
+            format!(":2,{}", chars.into_iter().collect::<String>())
         }
     }
 
-    // Sort flags alphabetically (Maildir convention)
-    chars.sort_unstable();
-    chars.into_iter().collect()
-}
+    fn is_valid_message_file(&self, path: &Path) -> bool {
+        // Must be a file (not directory)
+        if !path.is_file() {
+            return false;
+        }
 
-/// Extract username and mailbox name from a Maildir path
-///
-/// Expected path format: `<root>/<username>/<mailbox>/[new|cur|tmp]/<filename>`
-pub fn parse_maildir_path(path: &Path, root: &Path) -> Option<(String, String, String)> {
-    let relative = path.strip_prefix(root).ok()?;
-    let components: Vec<_> = relative.components().collect();
+        // Parent must be 'new' or 'cur'
+        if let Some(parent) = path.parent() {
+            if let Some(parent_name) = parent.file_name().and_then(|n| n.to_str()) {
+                return parent_name == "new" || parent_name == "cur";
+            }
+        }
 
-    if components.len() < 3 {
-        return None;
+        false
     }
-
-    let username = components[0].as_os_str().to_str()?.to_string();
-    let mailbox = components[1].as_os_str().to_str()?.to_string();
-
-    // The subdirectory should be one of: new, cur, tmp
-    let subdir = if components.len() >= 3 {
-        components[2].as_os_str().to_str()?.to_string()
-    } else {
-        return None;
-    };
-
-    // Only process messages in 'new' or 'cur', not 'tmp'
-    if subdir != "new" && subdir != "cur" {
-        return None;
-    }
-
-    Some((username, mailbox, subdir))
 }
 
 #[cfg(test)]
@@ -146,10 +148,15 @@ mod tests {
 
     #[test]
     fn test_parse_maildir_filename_with_flags() {
+        let root = PathBuf::from("/mail");
         let path = PathBuf::from("/mail/user/INBOX/cur/1234567890.M123P456.hostname:2,RS");
-        let msg = parse_maildir_filename(&path).unwrap();
+        let format = MaildirFormat::new();
+
+        let msg = format.parse_message_path(&path, &root).unwrap();
 
         assert_eq!(msg.unique_id, "1234567890.M123P456.hostname");
+        assert_eq!(msg.username, "user");
+        assert_eq!(msg.mailbox, "INBOX");
         assert_eq!(msg.flags.len(), 2);
         assert!(msg.flags.contains(&MessageFlag::Answered));
         assert!(msg.flags.contains(&MessageFlag::Seen));
@@ -158,8 +165,11 @@ mod tests {
 
     #[test]
     fn test_parse_maildir_filename_without_flags() {
+        let root = PathBuf::from("/mail");
         let path = PathBuf::from("/mail/user/INBOX/new/1234567890.M123P456.hostname");
-        let msg = parse_maildir_filename(&path).unwrap();
+        let format = MaildirFormat::new();
+
+        let msg = format.parse_message_path(&path, &root).unwrap();
 
         assert_eq!(msg.unique_id, "1234567890.M123P456.hostname");
         assert_eq!(msg.flags.len(), 0);
@@ -168,8 +178,11 @@ mod tests {
 
     #[test]
     fn test_parse_maildir_filename_all_flags() {
+        let root = PathBuf::from("/mail");
         let path = PathBuf::from("/mail/user/INBOX/cur/123.456:2,DFRST");
-        let msg = parse_maildir_filename(&path).unwrap();
+        let format = MaildirFormat::new();
+
+        let msg = format.parse_message_path(&path, &root).unwrap();
 
         assert_eq!(msg.flags.len(), 5);
         assert!(msg.flags.contains(&MessageFlag::Draft));
@@ -180,33 +193,34 @@ mod tests {
     }
 
     #[test]
-    fn test_flags_to_maildir_string() {
+    fn test_flags_to_filename_component() {
+        let format = MaildirFormat::new();
         let flags = vec![
             MessageFlag::Seen,
             MessageFlag::Answered,
             MessageFlag::Flagged,
         ];
 
-        let maildir_str = flags_to_maildir_string(&flags);
-        assert_eq!(maildir_str, "FRS");  // Alphabetically sorted
+        let component = format.flags_to_filename_component(&flags);
+        assert_eq!(component, ":2,FRS"); // Alphabetically sorted
     }
 
     #[test]
-    fn test_parse_maildir_path() {
-        let root = PathBuf::from("/mail");
-        let path = PathBuf::from("/mail/alice/INBOX/cur/123.456:2,S");
-
-        let (username, mailbox, subdir) = parse_maildir_path(&path, &root).unwrap();
-        assert_eq!(username, "alice");
-        assert_eq!(mailbox, "INBOX");
-        assert_eq!(subdir, "cur");
-    }
-
-    #[test]
-    fn test_parse_maildir_path_ignores_tmp() {
+    fn test_parse_ignores_tmp() {
         let root = PathBuf::from("/mail");
         let path = PathBuf::from("/mail/alice/INBOX/tmp/123.456");
+        let format = MaildirFormat::new();
 
-        assert!(parse_maildir_path(&path, &root).is_none());
+        assert!(format.parse_message_path(&path, &root).is_none());
+    }
+
+    #[test]
+    fn test_watch_subdirectories() {
+        let format = MaildirFormat::new();
+        let subdirs = format.watch_subdirectories();
+
+        assert_eq!(subdirs.len(), 2);
+        assert!(subdirs.contains(&"new"));
+        assert!(subdirs.contains(&"cur"));
     }
 }

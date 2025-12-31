@@ -8,6 +8,7 @@ use crate::error::Result;
 use crate::types::MessageId;
 use std::path::PathBuf;
 
+pub mod format;
 pub mod r#impl;
 pub mod watcher;
 

@@ -7,4 +7,4 @@ pub mod maildir;
 pub mod filesystem;
 
 pub use filesystem::FilesystemWatcher;
-pub use maildir::{MaildirMessage, parse_maildir_filename};
+pub use maildir::MaildirFormat;
