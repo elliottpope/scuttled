@@ -1,7 +1,8 @@
 //! Filesystem-based mail store watcher implementation
 //!
-//! Watches mailbox directories for changes and propagates them to the Index
-//! and EventBus using a pluggable MailboxFormat parser.
+//! Watches mailbox directories for changes and publishes events to the EventBus
+//! using a pluggable MailboxFormat parser. Index and other components subscribe
+//! to these events to stay synchronized with filesystem changes.
 
 use async_std::channel::{bounded, Receiver, Sender};
 use async_std::fs;
@@ -19,10 +20,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::events::{Event, EventBus};
-use crate::index::{Index, IndexedMessage};
 use crate::mailstore::format::MailboxFormat;
 use crate::mailstore::MailStoreWatcher;
-use crate::types::{MessageFlag, MessageId};
+use crate::types::MessageFlag;
 
 /// Commands for the watcher loop
 enum WatchCommand {
@@ -45,14 +45,11 @@ struct WatcherState {
     watched_mailboxes: HashMap<(String, String), PathBuf>,
     /// Map from filesystem path to (username, mailbox)
     path_to_mailbox: HashMap<PathBuf, (String, String)>,
-    /// Map from unique_id to MessageId for tracking messages
-    message_mapping: HashMap<String, MessageId>,
 }
 
 /// Filesystem-based watcher for mailbox directories
 pub struct FilesystemWatcher {
     root: PathBuf,
-    index: Arc<dyn Index>,
     event_bus: Arc<EventBus>,
     format: Arc<dyn MailboxFormat>,
     command_tx: Sender<WatchCommand>,
@@ -63,12 +60,10 @@ impl FilesystemWatcher {
     ///
     /// # Arguments
     /// * `root_path` - Root directory for mail storage
-    /// * `index` - Index implementation to update when changes are detected
     /// * `event_bus` - Event bus for publishing events
     /// * `format` - Mailbox format parser (e.g., Maildir, mbox)
     pub async fn new<P: AsRef<Path>>(
         root_path: P,
-        index: Arc<dyn Index>,
         event_bus: Arc<EventBus>,
         format: Arc<dyn MailboxFormat>,
     ) -> Result<Self> {
@@ -84,13 +79,11 @@ impl FilesystemWatcher {
 
         // Spawn the watcher loop
         let root_clone = root_path.clone();
-        let index_clone = index.clone();
         let event_bus_clone = event_bus.clone();
         let format_clone = format.clone();
         task::spawn(watcher_loop(
             command_rx,
             root_clone,
-            index_clone,
             event_bus_clone,
             format_clone,
         ));
@@ -99,7 +92,6 @@ impl FilesystemWatcher {
 
         Ok(Self {
             root: root_path,
-            index,
             event_bus,
             format,
             command_tx,
@@ -151,14 +143,12 @@ impl MailStoreWatcher for FilesystemWatcher {
 async fn watcher_loop(
     command_rx: Receiver<WatchCommand>,
     root: PathBuf,
-    index: Arc<dyn Index>,
     event_bus: Arc<EventBus>,
     format: Arc<dyn MailboxFormat>,
 ) {
     let state = Arc::new(RwLock::new(WatcherState {
         watched_mailboxes: HashMap::new(),
         path_to_mailbox: HashMap::new(),
-        message_mapping: HashMap::new(),
     }));
 
     // Create the filesystem event channel
@@ -166,14 +156,12 @@ async fn watcher_loop(
 
     // Spawn the filesystem event processor
     let state_clone = state.clone();
-    let index_clone = index.clone();
     let event_bus_clone = event_bus.clone();
     let root_clone = root.clone();
     let format_clone = format.clone();
     task::spawn(event_processor(
         event_rx,
         state_clone,
-        index_clone,
         event_bus_clone,
         root_clone,
         format_clone,
@@ -209,7 +197,6 @@ async fn watcher_loop(
                     &mut watcher,
                     &state,
                     &root,
-                    &index,
                     &event_bus,
                     &format,
                     &username,
@@ -240,7 +227,6 @@ async fn handle_watch(
     watcher: &Mutex<notify::RecommendedWatcher>,
     state: &Arc<RwLock<WatcherState>>,
     root: &Path,
-    index: &Arc<dyn Index>,
     event_bus: &Arc<EventBus>,
     format: &Arc<dyn MailboxFormat>,
     username: &str,
@@ -276,8 +262,8 @@ async fn handle_watch(
         (username.to_string(), mailbox.to_string()),
     );
 
-    // Scan existing messages and add them to the index
-    scan_existing_messages(root, username, mailbox, index, event_bus, format, &mut state).await?;
+    // Scan existing messages and publish events for them
+    scan_existing_messages(root, username, mailbox, event_bus, format).await?;
 
     info!("Started watching mailbox {}/{}", username, mailbox);
     Ok(())
@@ -314,15 +300,13 @@ async fn handle_unwatch(
     }
 }
 
-/// Scan existing messages in a mailbox and add them to the index
+/// Scan existing messages in a mailbox and publish events for them
 async fn scan_existing_messages(
     root: &Path,
     username: &str,
     mailbox: &str,
-    index: &Arc<dyn Index>,
     event_bus: &Arc<EventBus>,
     format: &Arc<dyn MailboxFormat>,
-    state: &mut WatcherState,
 ) -> Result<()> {
     let mailbox_path = root.join(username).join(mailbox);
 
@@ -346,23 +330,14 @@ async fn scan_existing_messages(
 
             // Parse the message using the format
             if let Some(parsed) = format.parse_message_path(std_path, root) {
-                // Check if this message is already in the index
+                // Construct the relative path for the event
                 let message_path = format!("{}/{}/{}", username, mailbox, parsed.unique_id);
-                let existing_paths = index.list_message_paths(username, mailbox).await?;
-
-                if existing_paths.contains(&message_path) {
-                    debug!("Message already indexed: {}", message_path);
-                    continue;
-                }
 
                 // Read the message content
                 let content = fs::read(std_path).await?;
 
                 // Parse email headers
                 if let Ok(email) = mailparse::parse_mail(&content) {
-                    let message_id = MessageId::new();
-                    let uid = index.get_next_uid(username, mailbox).await?;
-
                     // Extract metadata from email
                     let from = email
                         .headers
@@ -385,7 +360,7 @@ async fn scan_existing_messages(
                         .map(|h| h.get_value())
                         .unwrap_or_default();
 
-                    let body_preview = email
+                    let body_preview: String = email
                         .get_body()
                         .unwrap_or_default()
                         .chars()
@@ -397,38 +372,25 @@ async fn scan_existing_messages(
                         flags.push(MessageFlag::Recent);
                     }
 
-                    let indexed_message = IndexedMessage {
-                        id: message_id,
-                        uid,
-                        mailbox: mailbox.to_string(),
-                        flags,
-                        internal_date: chrono::Utc::now(),
-                        size: content.len(),
-                        from,
-                        to,
-                        subject,
-                        body_preview,
-                    };
-
-                    // Add to index
-                    index.add_message(username, mailbox, indexed_message).await?;
-
-                    // Track the message
-                    state
-                        .message_mapping
-                        .insert(parsed.unique_id.clone(), message_id);
-
-                    // Publish event
+                    // Publish event - Index will subscribe and handle this
                     let _ = event_bus
                         .publish(Event::MessageCreated {
                             username: username.to_string(),
                             mailbox: mailbox.to_string(),
-                            message_id,
                             unique_id: parsed.unique_id.clone(),
+                            path: message_path.clone(),
+                            flags,
+                            is_new: parsed.is_new,
+                            from,
+                            to,
+                            subject,
+                            body_preview,
+                            size: content.len(),
+                            internal_date: chrono::Utc::now(),
                         })
                         .await;
 
-                    debug!("Indexed existing message: {}", message_path);
+                    debug!("Published event for existing message: {}", message_path);
                 }
             }
         }
@@ -437,11 +399,10 @@ async fn scan_existing_messages(
     Ok(())
 }
 
-/// Process filesystem events and update the index accordingly
+/// Process filesystem events and publish to event bus
 async fn event_processor(
     event_rx: Receiver<Result<notify::Event>>,
     state: Arc<RwLock<WatcherState>>,
-    index: Arc<dyn Index>,
     event_bus: Arc<EventBus>,
     root: PathBuf,
     format: Arc<dyn MailboxFormat>,
@@ -450,7 +411,7 @@ async fn event_processor(
         match event_result {
             Ok(event) => {
                 if let Err(e) =
-                    handle_filesystem_event(event, &state, &index, &event_bus, &root, &format).await
+                    handle_filesystem_event(event, &state, &event_bus, &root, &format).await
                 {
                     error!("Error handling filesystem event: {}", e);
                 }
@@ -466,7 +427,6 @@ async fn event_processor(
 async fn handle_filesystem_event(
     event: notify::Event,
     state: &Arc<RwLock<WatcherState>>,
-    index: &Arc<dyn Index>,
     event_bus: &Arc<EventBus>,
     root: &Path,
     format: &Arc<dyn MailboxFormat>,
@@ -475,19 +435,19 @@ async fn handle_filesystem_event(
         notify::EventKind::Create(_) => {
             // New file created
             for path in event.paths {
-                handle_create_event(&path, state, index, event_bus, root, format).await?;
+                handle_create_event(&path, state, event_bus, root, format).await?;
             }
         }
         notify::EventKind::Modify(_) => {
             // File modified (renamed when flags change)
             for path in event.paths {
-                handle_modify_event(&path, state, index, event_bus, root, format).await?;
+                handle_modify_event(&path, state, event_bus, root, format).await?;
             }
         }
         notify::EventKind::Remove(_) => {
             // File deleted
             for path in event.paths {
-                handle_remove_event(&path, state, index, event_bus, root, format).await?;
+                handle_remove_event(&path, state, event_bus, root, format).await?;
             }
         }
         _ => {
@@ -501,8 +461,7 @@ async fn handle_filesystem_event(
 /// Handle file creation event
 async fn handle_create_event(
     path: &Path,
-    state: &Arc<RwLock<WatcherState>>,
-    index: &Arc<dyn Index>,
+    _state: &Arc<RwLock<WatcherState>>,
     event_bus: &Arc<EventBus>,
     root: &Path,
     format: &Arc<dyn MailboxFormat>,
@@ -527,9 +486,6 @@ async fn handle_create_event(
 
         // Parse email headers
         if let Ok(email) = mailparse::parse_mail(&content) {
-            let message_id = MessageId::new();
-            let uid = index.get_next_uid(&parsed.username, &parsed.mailbox).await?;
-
             let from = email
                 .headers
                 .iter()
@@ -551,7 +507,7 @@ async fn handle_create_event(
                 .map(|h| h.get_value())
                 .unwrap_or_default();
 
-            let body_preview = email
+            let body_preview: String = email
                 .get_body()
                 .unwrap_or_default()
                 .chars()
@@ -563,42 +519,29 @@ async fn handle_create_event(
                 flags.push(MessageFlag::Recent);
             }
 
-            let indexed_message = IndexedMessage {
-                id: message_id,
-                uid,
-                mailbox: parsed.mailbox.clone(),
-                flags,
-                internal_date: chrono::Utc::now(),
-                size: content.len(),
-                from,
-                to,
-                subject,
-                body_preview,
-            };
+            // Construct the relative path for the event
+            let message_path = format!("{}/{}/{}", parsed.username, parsed.mailbox, parsed.unique_id);
 
-            // Add to index
-            index
-                .add_message(&parsed.username, &parsed.mailbox, indexed_message)
-                .await?;
-
-            // Track the message
-            let mut state = state.write().await;
-            state
-                .message_mapping
-                .insert(parsed.unique_id.clone(), message_id);
-
-            // Publish event
+            // Publish event - Index will subscribe and handle this
             let _ = event_bus
                 .publish(Event::MessageCreated {
                     username: parsed.username.clone(),
                     mailbox: parsed.mailbox.clone(),
-                    message_id,
                     unique_id: parsed.unique_id.clone(),
+                    path: message_path,
+                    flags,
+                    is_new: parsed.is_new,
+                    from,
+                    to,
+                    subject,
+                    body_preview,
+                    size: content.len(),
+                    internal_date: chrono::Utc::now(),
                 })
                 .await;
 
             info!(
-                "Indexed new message: {}/{}/{}",
+                "Published event for new message: {}/{}/{}",
                 parsed.username, parsed.mailbox, parsed.unique_id
             );
         }
@@ -610,42 +553,35 @@ async fn handle_create_event(
 /// Handle file modification event (typically a rename for flag changes)
 async fn handle_modify_event(
     path: &Path,
-    state: &Arc<RwLock<WatcherState>>,
-    index: &Arc<dyn Index>,
+    _state: &Arc<RwLock<WatcherState>>,
     event_bus: &Arc<EventBus>,
     root: &Path,
     format: &Arc<dyn MailboxFormat>,
 ) -> Result<()> {
     // Parse using format
     if let Some(parsed) = format.parse_message_path(path, root) {
-        let state_read = state.read().await;
-        if let Some(&message_id) = state_read.message_mapping.get(&parsed.unique_id) {
-            drop(state_read);
+        debug!("Message flags changed: {:?}", path);
 
-            debug!("Message flags changed: {:?}", path);
-
-            // Update flags in the index
-            let mut flags = parsed.flags.clone();
-            if parsed.is_new {
-                flags.push(MessageFlag::Recent);
-            }
-
-            index.update_flags(message_id, flags.clone()).await?;
-
-            // Publish event
-            let _ = event_bus
-                .publish(Event::MessageModified {
-                    message_id,
-                    unique_id: parsed.unique_id.clone(),
-                    flags,
-                })
-                .await;
-
-            info!(
-                "Updated message flags: {}/{}/{}",
-                parsed.username, parsed.mailbox, parsed.unique_id
-            );
+        // Build flags from parsed data
+        let mut flags = parsed.flags.clone();
+        if parsed.is_new {
+            flags.push(MessageFlag::Recent);
         }
+
+        // Publish event - Index will subscribe and handle this
+        let _ = event_bus
+            .publish(Event::MessageModified {
+                username: parsed.username.clone(),
+                mailbox: parsed.mailbox.clone(),
+                unique_id: parsed.unique_id.clone(),
+                flags,
+            })
+            .await;
+
+        info!(
+            "Published event for modified message: {}/{}/{}",
+            parsed.username, parsed.mailbox, parsed.unique_id
+        );
     }
 
     Ok(())
@@ -654,35 +590,27 @@ async fn handle_modify_event(
 /// Handle file removal event
 async fn handle_remove_event(
     path: &Path,
-    state: &Arc<RwLock<WatcherState>>,
-    index: &Arc<dyn Index>,
+    _state: &Arc<RwLock<WatcherState>>,
     event_bus: &Arc<EventBus>,
     root: &Path,
     format: &Arc<dyn MailboxFormat>,
 ) -> Result<()> {
     if let Some(parsed) = format.parse_message_path(path, root) {
-        let mut state_write = state.write().await;
-        if let Some(message_id) = state_write.message_mapping.remove(&parsed.unique_id) {
-            drop(state_write);
+        debug!("Message deleted: {:?}", path);
 
-            debug!("Message deleted: {:?}", path);
+        // Publish event - Index will subscribe and handle this
+        let _ = event_bus
+            .publish(Event::MessageDeleted {
+                username: parsed.username.clone(),
+                mailbox: parsed.mailbox.clone(),
+                unique_id: parsed.unique_id.clone(),
+            })
+            .await;
 
-            // Remove from index
-            index.delete_message(message_id).await?;
-
-            // Publish event
-            let _ = event_bus
-                .publish(Event::MessageDeleted {
-                    message_id,
-                    unique_id: parsed.unique_id.clone(),
-                })
-                .await;
-
-            info!(
-                "Removed message from index: {}/{}/{}",
-                parsed.username, parsed.mailbox, parsed.unique_id
-            );
-        }
+        info!(
+            "Published event for deleted message: {}/{}/{}",
+            parsed.username, parsed.mailbox, parsed.unique_id
+        );
     }
 
     Ok(())
@@ -692,32 +620,26 @@ async fn handle_remove_event(
 mod tests {
     use super::*;
     use crate::events::EventBus;
-    use crate::index::r#impl::InMemoryIndex;
     use crate::mailstore::watcher::MaildirFormat;
     use tempfile::TempDir;
 
     #[async_std::test]
     async fn test_watcher_creation() {
         let tmp_dir = TempDir::new().unwrap();
-        let index = Arc::new(InMemoryIndex::new());
         let event_bus = Arc::new(EventBus::new());
         let format = Arc::new(MaildirFormat::new());
 
-        let watcher = FilesystemWatcher::new(tmp_dir.path(), index, event_bus, format).await;
+        let watcher = FilesystemWatcher::new(tmp_dir.path(), event_bus, format).await;
         assert!(watcher.is_ok());
     }
 
     #[async_std::test]
     async fn test_watch_mailbox() {
         let tmp_dir = TempDir::new().unwrap();
-        let index = Arc::new(InMemoryIndex::new());
         let event_bus = Arc::new(EventBus::new());
         let format = Arc::new(MaildirFormat::new());
 
-        // Create mailbox in index first
-        index.create_mailbox("alice", "INBOX").await.unwrap();
-
-        let watcher = FilesystemWatcher::new(tmp_dir.path(), index, event_bus, format)
+        let watcher = FilesystemWatcher::new(tmp_dir.path(), event_bus, format)
             .await
             .unwrap();
 

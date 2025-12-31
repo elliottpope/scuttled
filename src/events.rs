@@ -40,13 +40,14 @@ pub enum Event {
         username: String,
         mailbox: String,
         unique_id: String,
-        /// Raw email content
-        content: Vec<u8>,
+        /// Path to the message file (relative to mailstore root)
+        /// Index can use this with MailStore to retrieve full content if needed
+        path: String,
         /// Message flags from mailbox format
         flags: Vec<MessageFlag>,
         /// Whether this is a new/unseen message
         is_new: bool,
-        /// Parsed email metadata
+        /// Parsed email metadata (to avoid re-parsing)
         from: String,
         to: String,
         subject: String,
@@ -329,7 +330,7 @@ mod tests {
             username: "bob".to_string(),
             mailbox: "Sent".to_string(),
             unique_id: "test123".to_string(),
-            content: b"test email content".to_vec(),
+            path: "bob/Sent/test123.eml".to_string(),
             flags: vec![],
             is_new: true,
             from: "sender@example.com".to_string(),
@@ -363,7 +364,7 @@ mod tests {
             username: "alice".to_string(),
             mailbox: "INBOX".to_string(),
             unique_id: "msg1".to_string(),
-            content: b"test".to_vec(),
+            path: "alice/INBOX/msg1.eml".to_string(),
             flags: vec![],
             is_new: true,
             from: "test@example.com".to_string(),
