@@ -27,12 +27,14 @@ Index (Subscriber)
 ## Updated Event Types
 
 ### MessageCreated
-Contains all data needed for Index to add the message:
+Contains metadata and a path reference (not the full content to avoid large copies):
 - `username`, `mailbox`, `unique_id`
-- `content` (raw email bytes)
+- `path` (relative path to message file - Index can use MailStore to retrieve content if needed)
 - `flags`, `is_new`
-- `from`, `to`, `subject`, `body_preview`
+- `from`, `to`, `subject`, `body_preview` (parsed metadata to avoid re-parsing)
 - `size`, `internal_date`
+
+**Why path instead of content?** Large emails with attachments could be megabytes. Passing full content through events would create unnecessary copies. The path allows Index to retrieve content from MailStore only when needed.
 
 ###  MessageModified
 Contains flag update information:
@@ -97,7 +99,7 @@ pub async fn start_event_subscription(
                     username,
                     mailbox,
                     unique_id,
-                    content,
+                    path,
                     flags,
                     from,
                     to,
@@ -123,7 +125,14 @@ pub async fn start_event_subscription(
                         body_preview,
                     };
 
+                    // Add to index with path for future retrieval
                     index.add_message(&username, &mailbox, indexed_message).await.unwrap();
+
+                    // Track unique_id -> message_id mapping for updates/deletes
+                    index.track_message(&unique_id, message_id).await.unwrap();
+
+                    // If needed, can retrieve full content from MailStore:
+                    // let content = mail_store.retrieve(&path).await.unwrap();
                 }
                 Event::MessageModified {
                     username,
