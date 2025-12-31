@@ -4,6 +4,7 @@
 //! an IMAP server using async Rust with async_std.
 
 pub mod error;
+pub mod events;
 pub mod types;
 pub mod protocol;
 pub mod connection;
