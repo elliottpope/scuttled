@@ -5,6 +5,7 @@
 
 use async_std::channel::{bounded, Receiver, Sender};
 use async_std::task;
+use chrono::{DateTime, Utc};
 use futures::channel::oneshot;
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
@@ -12,7 +13,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
-use crate::types::{MessageFlag, MessageId};
+use crate::types::MessageFlag;
 
 /// Event types that can occur in the system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,18 +39,34 @@ pub enum Event {
     MessageCreated {
         username: String,
         mailbox: String,
-        message_id: MessageId,
         unique_id: String,
+        /// Raw email content
+        content: Vec<u8>,
+        /// Message flags from mailbox format
+        flags: Vec<MessageFlag>,
+        /// Whether this is a new/unseen message
+        is_new: bool,
+        /// Parsed email metadata
+        from: String,
+        to: String,
+        subject: String,
+        body_preview: String,
+        /// Message size in bytes
+        size: usize,
+        /// When the message was added
+        internal_date: DateTime<Utc>,
     },
     /// A message was modified (flags changed, moved, etc.)
     MessageModified {
-        message_id: MessageId,
+        username: String,
+        mailbox: String,
         unique_id: String,
         flags: Vec<MessageFlag>,
     },
     /// A message was deleted
     MessageDeleted {
-        message_id: MessageId,
+        username: String,
+        mailbox: String,
         unique_id: String,
     },
 }
@@ -311,8 +328,16 @@ mod tests {
         let event = Event::MessageCreated {
             username: "bob".to_string(),
             mailbox: "Sent".to_string(),
-            message_id: MessageId::new(),
             unique_id: "test123".to_string(),
+            content: b"test email content".to_vec(),
+            flags: vec![],
+            is_new: true,
+            from: "sender@example.com".to_string(),
+            to: "bob@example.com".to_string(),
+            subject: "Test Subject".to_string(),
+            body_preview: "Test body".to_string(),
+            size: 100,
+            internal_date: Utc::now(),
         };
         bus.publish(event).await.unwrap();
 
@@ -337,8 +362,16 @@ mod tests {
         let message_event = Event::MessageCreated {
             username: "alice".to_string(),
             mailbox: "INBOX".to_string(),
-            message_id: MessageId::new(),
             unique_id: "msg1".to_string(),
+            content: b"test".to_vec(),
+            flags: vec![],
+            is_new: true,
+            from: "test@example.com".to_string(),
+            to: "alice@example.com".to_string(),
+            subject: "Test".to_string(),
+            body_preview: "Test".to_string(),
+            size: 50,
+            internal_date: Utc::now(),
         };
         bus.publish(message_event).await.unwrap();
 
