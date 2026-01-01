@@ -2,14 +2,29 @@
 //!
 //! The Index is responsible for tracking message metadata, performing searches,
 //! and managing mailbox state. It returns file paths for the MailStore to use.
+//!
+//! ## Architecture
+//!
+//! - `IndexBackend` trait: Low-level storage interface (in-memory, Tantivy, etc.)
+//! - `Indexer`: Public coordinating wrapper that adds EventBus integration and write ordering
+//! - Backend implementations are hidden; users interact only with `Indexer`
 
 use async_trait::async_trait;
 use crate::error::Result;
 use crate::types::*;
 
+pub(crate) mod backend;
+mod indexer;
 pub mod r#impl;
 
+// Re-export public types
+pub use indexer::Indexer;
+
 /// Trait for indexing and searching email contents
+///
+/// NOTE: This trait is kept for backward compatibility but most code should
+/// use the concrete `Indexer` type instead of `dyn Index`.
+/// The Indexer provides EventBus integration and write ordering automatically.
 #[async_trait]
 pub trait Index: Send + Sync {
     /// Create a new mailbox
