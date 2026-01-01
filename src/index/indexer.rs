@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::events::{Event, EventBus, EventKind};
 use crate::index::backend::IndexBackend;
 use crate::index::IndexedMessage;
+use crate::mailboxes::Mailboxes;
 use crate::types::*;
 
 /// Write commands for the indexer (only writes go through the channel)
@@ -25,7 +26,6 @@ enum WriteCommand {
     AddMessage(String, String, IndexedMessage, oneshot::Sender<Result<String>>),
     UpdateFlags(MessageId, Vec<MessageFlag>, oneshot::Sender<Result<()>>),
     DeleteMessage(MessageId, oneshot::Sender<Result<()>>),
-    GetNextUid(String, String, oneshot::Sender<Result<Uid>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -36,10 +36,12 @@ enum WriteCommand {
 /// - Write ordering via channels (ensures consistency)
 /// - EventBus integration (subscribes to filesystem events)
 /// - Unique ID tracking (maps filesystem paths to MessageIds)
+/// - UID assignment via Mailboxes (for global synchronization)
 pub struct Indexer {
     backend: Arc<RwLock<Box<dyn IndexBackend>>>,
     write_tx: Sender<WriteCommand>,
     unique_id_mapping: Arc<RwLock<HashMap<String, MessageId>>>,
+    mailboxes: Option<Arc<dyn Mailboxes>>,
 }
 
 impl Indexer {
@@ -47,8 +49,8 @@ impl Indexer {
     ///
     /// Note: This is internal. Users should use backend-specific constructors
     /// like `create_inmemory_index()` instead.
-    pub(crate) fn new(backend: Box<dyn IndexBackend>) -> Self {
-        Self::with_event_bus(backend, None)
+    pub(crate) fn new(backend: Box<dyn IndexBackend>, mailboxes: Option<Arc<dyn Mailboxes>>) -> Self {
+        Self::with_event_bus(backend, None, mailboxes)
     }
 
     /// Create a new Indexer with optional EventBus integration
@@ -58,11 +60,14 @@ impl Indexer {
     /// - Update the index when filesystem changes occur
     /// - Track unique_id to MessageId mappings
     ///
+    /// If Mailboxes is provided, the Indexer will use it for UID assignment.
+    ///
     /// Note: This is internal. Users should use backend-specific constructors
     /// like `create_inmemory_index_with_eventbus()` instead.
     pub(crate) fn with_event_bus(
         backend: Box<dyn IndexBackend>,
         event_bus: Option<Arc<EventBus>>,
+        mailboxes: Option<Arc<dyn Mailboxes>>,
     ) -> Self {
         let backend = Arc::new(RwLock::new(backend));
         let unique_id_mapping = Arc::new(RwLock::new(HashMap::new()));
@@ -77,9 +82,16 @@ impl Indexer {
             let backend_clone = backend.clone();
             let mapping_clone = unique_id_mapping.clone();
             let write_tx_clone = write_tx.clone();
+            let mailboxes_clone = mailboxes.clone();
             task::spawn(async move {
-                if let Err(e) =
-                    event_listener(bus, backend_clone, mapping_clone, write_tx_clone).await
+                if let Err(e) = event_listener(
+                    bus,
+                    backend_clone,
+                    mapping_clone,
+                    write_tx_clone,
+                    mailboxes_clone,
+                )
+                .await
                 {
                     error!("Event listener error: {}", e);
                 }
@@ -90,6 +102,7 @@ impl Indexer {
             backend,
             write_tx,
             unique_id_mapping,
+            mailboxes,
         }
     }
 
@@ -218,21 +231,6 @@ impl Indexer {
         backend.search(username, mailbox, query).await
     }
 
-    /// Get the next available UID for a mailbox
-    pub async fn get_next_uid(&self, username: &str, mailbox: &str) -> Result<Uid> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::GetNextUid(
-                username.to_string(),
-                mailbox.to_string(),
-                tx,
-            ))
-            .await
-            .map_err(|_| Error::Internal("Writer loop stopped".to_string()))?;
-        rx.await
-            .map_err(|_| Error::Internal("Writer loop dropped reply".to_string()))?
-    }
-
     /// Shutdown the indexer gracefully
     pub async fn shutdown(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -274,11 +272,6 @@ async fn writer_loop(
                 let result = backend.delete_message(id).await;
                 let _ = reply.send(result);
             }
-            WriteCommand::GetNextUid(username, mailbox, reply) => {
-                let mut backend = backend.write().await;
-                let result = backend.get_next_uid(&username, &mailbox).await;
-                let _ = reply.send(result);
-            }
             WriteCommand::Shutdown(reply) => {
                 let _ = reply.send(());
                 break;
@@ -293,6 +286,7 @@ async fn event_listener(
     _backend: Arc<RwLock<Box<dyn IndexBackend>>>,
     unique_id_mapping: Arc<RwLock<HashMap<String, MessageId>>>,
     write_tx: Sender<WriteCommand>,
+    mailboxes: Option<Arc<dyn Mailboxes>>,
 ) -> Result<()> {
     // Subscribe to message events
     let (subscription_id, event_rx) = event_bus
@@ -330,28 +324,21 @@ async fn event_listener(
                     username, mailbox, unique_id
                 );
 
-                // Get next UID for the message
-                let (uid_tx, uid_rx) = oneshot::channel();
-                let _ = write_tx
-                    .send(WriteCommand::GetNextUid(
-                        username.clone(),
-                        mailbox.clone(),
-                        uid_tx,
-                    ))
-                    .await;
-
-                let uid = match uid_rx.await {
-                    Ok(Ok(uid)) => uid,
-                    Ok(Err(e)) => {
+                // Get next UID for the message from Mailboxes
+                let uid = match &mailboxes {
+                    Some(mb) => match mb.get_next_uid(&username, &mailbox).await {
+                        Ok(uid) => uid,
+                        Err(e) => {
+                            error!(
+                                "Failed to get next UID for message {}/{}/{}: {}",
+                                username, mailbox, unique_id, e
+                            );
+                            continue;
+                        }
+                    },
+                    None => {
                         error!(
-                            "Failed to get next UID for message {}/{}/{}: {}",
-                            username, mailbox, unique_id, e
-                        );
-                        continue;
-                    }
-                    Err(_) => {
-                        error!(
-                            "Writer loop dropped UID reply for {}/{}/{}",
+                            "No Mailboxes available for UID assignment for {}/{}/{}",
                             username, mailbox, unique_id
                         );
                         continue;

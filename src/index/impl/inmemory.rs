@@ -102,18 +102,6 @@ impl IndexBackend for InMemoryBackend {
         Ok(self.mailboxes.contains_key(&key))
     }
 
-    async fn get_next_uid(&mut self, username: &str, mailbox: &str) -> Result<Uid> {
-        let key = Self::make_mailbox_key(username, mailbox);
-
-        if let Some(mailbox_state) = self.mailboxes.get_mut(&key) {
-            let uid = mailbox_state.uid_counter;
-            mailbox_state.uid_counter += 1;
-            Ok(uid)
-        } else {
-            Err(Error::NotFound(format!("Mailbox {} not found", mailbox)))
-        }
-    }
-
     async fn add_message(
         &mut self,
         username: &str,
@@ -247,15 +235,18 @@ fn matches_query(message: &IndexedMessage, query: &SearchQuery) -> bool {
 pub type InMemoryIndex = Indexer;
 
 // Helper function to create an InMemoryIndex (Indexer with InMemoryBackend)
-pub fn create_inmemory_index() -> InMemoryIndex {
-    Indexer::new(Box::new(InMemoryBackend::new()))
+pub fn create_inmemory_index(
+    mailboxes: Option<std::sync::Arc<dyn crate::mailboxes::Mailboxes>>,
+) -> InMemoryIndex {
+    Indexer::new(Box::new(InMemoryBackend::new()), mailboxes)
 }
 
 // Helper function to create an InMemoryIndex with EventBus integration
 pub fn create_inmemory_index_with_eventbus(
     event_bus: std::sync::Arc<crate::events::EventBus>,
+    mailboxes: Option<std::sync::Arc<dyn crate::mailboxes::Mailboxes>>,
 ) -> InMemoryIndex {
-    Indexer::with_event_bus(Box::new(InMemoryBackend::new()), Some(event_bus))
+    Indexer::with_event_bus(Box::new(InMemoryBackend::new()), Some(event_bus), mailboxes)
 }
 
 #[cfg(test)]
@@ -266,7 +257,7 @@ mod tests {
 
     #[async_std::test]
     async fn test_create_and_initialize_mailbox() {
-        let index = create_inmemory_index();
+        let index = create_inmemory_index(None);
 
         index
             .initialize_mailbox("alice", "INBOX")
@@ -280,7 +271,7 @@ mod tests {
 
     #[async_std::test]
     async fn test_add_and_retrieve_message() {
-        let index = create_inmemory_index();
+        let index = create_inmemory_index(None);
 
         index
             .initialize_mailbox("alice", "INBOX")
@@ -312,7 +303,7 @@ mod tests {
 
     #[async_std::test]
     async fn test_search() {
-        let index = create_inmemory_index();
+        let index = create_inmemory_index(None);
         index
             .initialize_mailbox("alice", "INBOX")
             .await
@@ -346,7 +337,7 @@ mod tests {
 
     #[async_std::test]
     async fn test_delete_message() {
-        let index = create_inmemory_index();
+        let index = create_inmemory_index(None);
         index
             .initialize_mailbox("alice", "INBOX")
             .await
@@ -377,7 +368,7 @@ mod tests {
 
     #[async_std::test]
     async fn test_remove_mailbox_data() {
-        let index = create_inmemory_index();
+        let index = create_inmemory_index(None);
         index
             .initialize_mailbox("alice", "Drafts")
             .await
@@ -391,14 +382,21 @@ mod tests {
     #[async_std::test]
     async fn test_event_bus_integration() {
         use crate::events::Event;
+        use crate::mailboxes::r#impl::memory::InMemoryMailboxes;
+        use crate::mailboxes::Mailboxes;
 
-        // Create EventBus and Index with event integration
+        // Create EventBus, Mailboxes, and Index with event integration
         let event_bus = Arc::new(EventBus::new());
-        let index = create_inmemory_index_with_eventbus(event_bus.clone());
+        let mailboxes = Arc::new(InMemoryMailboxes::new());
+        let index = create_inmemory_index_with_eventbus(event_bus.clone(), Some(mailboxes.clone()));
 
-        // Initialize mailbox
+        // Initialize mailbox in both index and mailboxes registry
         index
             .initialize_mailbox("alice", "INBOX")
+            .await
+            .unwrap();
+        mailboxes
+            .create_mailbox("alice", "INBOX")
             .await
             .unwrap();
 
