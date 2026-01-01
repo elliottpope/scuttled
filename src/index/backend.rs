@@ -1,8 +1,7 @@
 //! Low-level index storage backend trait
 //!
 //! This trait defines the storage interface that index implementations must provide.
-//! It focuses on message indexing and search, with minimal mailbox state tracking
-//! needed for message operations (like UID assignment).
+//! It focuses on message indexing and search operations only.
 
 use async_trait::async_trait;
 use crate::error::Result;
@@ -17,17 +16,6 @@ use crate::types::*;
 /// Note: This trait is internal to the index module. External code should use `Indexer`.
 #[async_trait]
 pub(crate) trait IndexBackend: Send + Sync {
-    // Mailbox lifecycle (minimal - just what Index needs for message operations)
-
-    /// Initialize a mailbox for indexing (creates uid counter, etc.)
-    async fn initialize_mailbox(&mut self, username: &str, mailbox: &str) -> Result<()>;
-
-    /// Remove all indexed data for a mailbox
-    async fn remove_mailbox_data(&mut self, username: &str, mailbox: &str) -> Result<()>;
-
-    /// Check if a mailbox exists in the index
-    async fn mailbox_exists(&self, username: &str, mailbox: &str) -> Result<bool>;
-
     // Message indexing operations
 
     /// Add a message to the index
@@ -44,6 +32,9 @@ pub(crate) trait IndexBackend: Send + Sync {
 
     /// Delete a message from the index
     async fn delete_message(&mut self, id: MessageId) -> Result<()>;
+
+    /// Remove all messages for a given mailbox (used for cleanup on mailbox deletion)
+    async fn remove_messages_for_mailbox(&mut self, username: &str, mailbox: &str) -> Result<()>;
 
     // Message retrieval operations
 
