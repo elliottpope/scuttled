@@ -21,11 +21,10 @@ use crate::types::*;
 
 /// Write commands for the indexer (only writes go through the channel)
 enum WriteCommand {
-    InitializeMailbox(String, String, oneshot::Sender<Result<()>>),
-    RemoveMailboxData(String, String, oneshot::Sender<Result<()>>),
     AddMessage(String, String, IndexedMessage, oneshot::Sender<Result<String>>),
     UpdateFlags(MessageId, Vec<MessageFlag>, oneshot::Sender<Result<()>>),
     DeleteMessage(MessageId, oneshot::Sender<Result<()>>),
+    RemoveMessagesForMailbox(String, String, oneshot::Sender<Result<()>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -104,46 +103,6 @@ impl Indexer {
             unique_id_mapping,
             mailboxes,
         }
-    }
-
-    // Mailbox operations
-    // Note: These might eventually move to a separate Mailboxes component
-    // For now, they're here for backward compatibility
-
-    /// Initialize a mailbox in the index (creates UID counter, etc.)
-    pub async fn initialize_mailbox(&self, username: &str, mailbox: &str) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::InitializeMailbox(
-                username.to_string(),
-                mailbox.to_string(),
-                tx,
-            ))
-            .await
-            .map_err(|_| Error::Internal("Writer loop stopped".to_string()))?;
-        rx.await
-            .map_err(|_| Error::Internal("Writer loop dropped reply".to_string()))?
-    }
-
-    /// Remove all indexed data for a mailbox
-    pub async fn remove_mailbox_data(&self, username: &str, mailbox: &str) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(WriteCommand::RemoveMailboxData(
-                username.to_string(),
-                mailbox.to_string(),
-                tx,
-            ))
-            .await
-            .map_err(|_| Error::Internal("Writer loop stopped".to_string()))?;
-        rx.await
-            .map_err(|_| Error::Internal("Writer loop dropped reply".to_string()))?
-    }
-
-    /// Check if a mailbox exists in the index
-    pub async fn mailbox_exists(&self, username: &str, mailbox: &str) -> Result<bool> {
-        let backend = self.backend.read().await;
-        backend.mailbox_exists(username, mailbox).await
     }
 
     // Message operations
@@ -247,16 +206,6 @@ async fn writer_loop(
 ) {
     while let Ok(cmd) = rx.recv().await {
         match cmd {
-            WriteCommand::InitializeMailbox(username, mailbox, reply) => {
-                let mut backend = backend.write().await;
-                let result = backend.initialize_mailbox(&username, &mailbox).await;
-                let _ = reply.send(result);
-            }
-            WriteCommand::RemoveMailboxData(username, mailbox, reply) => {
-                let mut backend = backend.write().await;
-                let result = backend.remove_mailbox_data(&username, &mailbox).await;
-                let _ = reply.send(result);
-            }
             WriteCommand::AddMessage(username, mailbox, message, reply) => {
                 let mut backend = backend.write().await;
                 let result = backend.add_message(&username, &mailbox, message).await;
@@ -270,6 +219,11 @@ async fn writer_loop(
             WriteCommand::DeleteMessage(id, reply) => {
                 let mut backend = backend.write().await;
                 let result = backend.delete_message(id).await;
+                let _ = reply.send(result);
+            }
+            WriteCommand::RemoveMessagesForMailbox(username, mailbox, reply) => {
+                let mut backend = backend.write().await;
+                let result = backend.remove_messages_for_mailbox(&username, &mailbox).await;
                 let _ = reply.send(result);
             }
             WriteCommand::Shutdown(reply) => {
@@ -288,17 +242,18 @@ async fn event_listener(
     write_tx: Sender<WriteCommand>,
     mailboxes: Option<Arc<dyn Mailboxes>>,
 ) -> Result<()> {
-    // Subscribe to message events
+    // Subscribe to message and mailbox events
     let (subscription_id, event_rx) = event_bus
         .subscribe(vec![
             EventKind::MessageCreated,
             EventKind::MessageModified,
             EventKind::MessageDeleted,
+            EventKind::MailboxDeleted,
         ])
         .await?;
 
     info!(
-        "Indexer subscribed to message events (subscription: {:?})",
+        "Indexer subscribed to message and mailbox events (subscription: {:?})",
         subscription_id
     );
 
@@ -490,6 +445,40 @@ async fn event_listener(
                         );
                     }
                 }
+            }
+            Event::MailboxDeleted { username, mailbox } => {
+                debug!(
+                    "Indexer received MailboxDeleted event: {}/{}",
+                    username, mailbox
+                );
+
+                // Remove all messages for this mailbox
+                let (tx, rx) = oneshot::channel();
+                let _ = write_tx
+                    .send(WriteCommand::RemoveMessagesForMailbox(
+                        username.clone(),
+                        mailbox.clone(),
+                        tx,
+                    ))
+                    .await;
+
+                match rx.await {
+                    Ok(Ok(())) => {
+                        info!("Indexer removed all messages for mailbox: {}/{}", username, mailbox);
+                    }
+                    Ok(Err(e)) => {
+                        error!("Failed to remove messages for mailbox {}/{}: {}", username, mailbox, e);
+                    }
+                    Err(_) => {
+                        error!("Writer loop dropped remove_messages_for_mailbox reply for {}/{}", username, mailbox);
+                    }
+                }
+
+                // Clean up unique_id mappings for this mailbox
+                let mut mapping = unique_id_mapping.write().await;
+                let mailbox_prefix = format!("{}/{}/", username, mailbox);
+                mapping.retain(|key, _| !key.starts_with(&mailbox_prefix));
+                drop(mapping);
             }
             _ => {
                 // Ignore other events

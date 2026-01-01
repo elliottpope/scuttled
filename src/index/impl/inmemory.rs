@@ -11,11 +11,6 @@ use crate::index::backend::IndexBackend;
 use crate::index::{IndexedMessage, Indexer};
 use crate::types::*;
 
-/// State for a single mailbox
-struct MailboxState {
-    uid_counter: Uid,
-}
-
 /// Message entry with metadata and path
 struct MessageEntry {
     metadata: IndexedMessage,
@@ -29,8 +24,6 @@ struct MessageEntry {
 /// It's focused purely on storage operations - EventBus integration and
 /// write ordering are handled by the Indexer wrapper.
 pub struct InMemoryBackend {
-    /// Mailbox state (uid counters) keyed by "username:mailbox"
-    mailboxes: HashMap<String, MailboxState>,
     /// Messages keyed by MessageId
     messages: HashMap<MessageId, MessageEntry>,
 }
@@ -39,13 +32,8 @@ impl InMemoryBackend {
     /// Create a new InMemoryBackend
     pub fn new() -> Self {
         Self {
-            mailboxes: HashMap::new(),
             messages: HashMap::new(),
         }
-    }
-
-    fn make_mailbox_key(username: &str, mailbox: &str) -> String {
-        format!("{}:{}", username, mailbox)
     }
 
     fn make_message_path(username: &str, mailbox: &str, message_id: &MessageId) -> String {
@@ -61,59 +49,12 @@ impl Default for InMemoryBackend {
 
 #[async_trait]
 impl IndexBackend for InMemoryBackend {
-    async fn initialize_mailbox(&mut self, username: &str, mailbox: &str) -> Result<()> {
-        let key = Self::make_mailbox_key(username, mailbox);
-
-        if self.mailboxes.contains_key(&key) {
-            return Err(Error::AlreadyExists(format!(
-                "Mailbox {} already initialized",
-                mailbox
-            )));
-        }
-
-        self.mailboxes.insert(
-            key,
-            MailboxState {
-                uid_counter: 1,
-            },
-        );
-
-        Ok(())
-    }
-
-    async fn remove_mailbox_data(&mut self, username: &str, mailbox: &str) -> Result<()> {
-        let key = Self::make_mailbox_key(username, mailbox);
-
-        if !self.mailboxes.contains_key(&key) {
-            return Err(Error::NotFound(format!("Mailbox {} not found", mailbox)));
-        }
-
-        // Remove all messages in the mailbox
-        self.messages.retain(|_, entry| {
-            !(entry.username == username && entry.metadata.mailbox == mailbox)
-        });
-
-        self.mailboxes.remove(&key);
-        Ok(())
-    }
-
-    async fn mailbox_exists(&self, username: &str, mailbox: &str) -> Result<bool> {
-        let key = Self::make_mailbox_key(username, mailbox);
-        Ok(self.mailboxes.contains_key(&key))
-    }
-
     async fn add_message(
         &mut self,
         username: &str,
         mailbox: &str,
         message: IndexedMessage,
     ) -> Result<String> {
-        let key = Self::make_mailbox_key(username, mailbox);
-
-        if !self.mailboxes.contains_key(&key) {
-            return Err(Error::NotFound(format!("Mailbox {} not found", mailbox)));
-        }
-
         let path = Self::make_message_path(username, mailbox, &message.id);
 
         self.messages.insert(
@@ -143,6 +84,14 @@ impl IndexBackend for InMemoryBackend {
         } else {
             Err(Error::NotFound(format!("Message {:?} not found", id)))
         }
+    }
+
+    async fn remove_messages_for_mailbox(&mut self, username: &str, mailbox: &str) -> Result<()> {
+        // Remove all messages in the mailbox
+        self.messages.retain(|_, entry| {
+            !(entry.username == username && entry.metadata.mailbox == mailbox)
+        });
+        Ok(())
     }
 
     async fn get_message_path(&self, id: MessageId) -> Result<Option<String>> {
@@ -256,27 +205,14 @@ mod tests {
     use async_std::sync::Arc;
 
     #[async_std::test]
-    async fn test_create_and_initialize_mailbox() {
-        let index = create_inmemory_index(None);
-
-        index
-            .initialize_mailbox("alice", "INBOX")
-            .await
-            .unwrap();
-        index.initialize_mailbox("alice", "Sent").await.unwrap();
-
-        assert!(index.mailbox_exists("alice", "INBOX").await.unwrap());
-        assert!(index.mailbox_exists("alice", "Sent").await.unwrap());
+    async fn test_create_index() {
+        let _index = create_inmemory_index(None);
+        // Index no longer tracks mailboxes - just verify it can be created
     }
 
     #[async_std::test]
     async fn test_add_and_retrieve_message() {
         let index = create_inmemory_index(None);
-
-        index
-            .initialize_mailbox("alice", "INBOX")
-            .await
-            .unwrap();
 
         let message = IndexedMessage {
             id: MessageId::new(),
@@ -304,10 +240,6 @@ mod tests {
     #[async_std::test]
     async fn test_search() {
         let index = create_inmemory_index(None);
-        index
-            .initialize_mailbox("alice", "INBOX")
-            .await
-            .unwrap();
 
         let message = IndexedMessage {
             id: MessageId::new(),
@@ -338,10 +270,6 @@ mod tests {
     #[async_std::test]
     async fn test_delete_message() {
         let index = create_inmemory_index(None);
-        index
-            .initialize_mailbox("alice", "INBOX")
-            .await
-            .unwrap();
 
         let message = IndexedMessage {
             id: MessageId::new(),
@@ -367,16 +295,30 @@ mod tests {
     }
 
     #[async_std::test]
-    async fn test_remove_mailbox_data() {
+    async fn test_mailbox_no_initialization_required() {
         let index = create_inmemory_index(None);
-        index
-            .initialize_mailbox("alice", "Drafts")
+
+        // Index no longer requires mailbox initialization
+        // Messages can be added directly to any mailbox
+        let message = IndexedMessage {
+            id: MessageId::new(),
+            uid: 1,
+            mailbox: "Drafts".to_string(),
+            flags: vec![],
+            from: "bob@example.com".to_string(),
+            to: "alice@example.com".to_string(),
+            subject: "Test".to_string(),
+            body_preview: "Test body".to_string(),
+            internal_date: chrono::Utc::now(),
+            size: 100,
+        };
+
+        let path = index
+            .add_message("alice", "Drafts", message.clone())
             .await
             .unwrap();
 
-        index.remove_mailbox_data("alice", "Drafts").await.unwrap();
-
-        assert!(!index.mailbox_exists("alice", "Drafts").await.unwrap());
+        assert!(path.contains("alice/Drafts"));
     }
 
     #[async_std::test]
@@ -390,11 +332,7 @@ mod tests {
         let mailboxes = Arc::new(InMemoryMailboxes::new());
         let index = create_inmemory_index_with_eventbus(event_bus.clone(), Some(mailboxes.clone()));
 
-        // Initialize mailbox in both index and mailboxes registry
-        index
-            .initialize_mailbox("alice", "INBOX")
-            .await
-            .unwrap();
+        // Initialize mailbox in mailboxes registry (for UID assignment)
         mailboxes
             .create_mailbox("alice", "INBOX")
             .await
