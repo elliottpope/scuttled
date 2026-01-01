@@ -28,9 +28,6 @@ pub(crate) trait IndexBackend: Send + Sync {
     /// Check if a mailbox exists in the index
     async fn mailbox_exists(&self, username: &str, mailbox: &str) -> Result<bool>;
 
-    /// Get the next available UID for a mailbox (and increment the counter)
-    async fn get_next_uid(&mut self, username: &str, mailbox: &str) -> Result<Uid>;
-
     // Message indexing operations
 
     /// Add a message to the index

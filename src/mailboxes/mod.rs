@@ -42,6 +42,12 @@ pub trait Mailboxes: Send + Sync {
     /// Update the next UID for a mailbox
     async fn update_next_uid(&self, id: &MailboxId, next_uid: Uid) -> Result<()>;
 
+    /// Get the next available UID for a mailbox and atomically increment it
+    ///
+    /// This operation must be atomic to ensure UIDs are unique across
+    /// concurrent sessions and instances.
+    async fn get_next_uid(&self, username: &str, mailbox: &str) -> Result<Uid>;
+
     /// Update the UID validity for a mailbox
     async fn update_uid_validity(&self, id: &MailboxId, uid_validity: u32) -> Result<()>;
 

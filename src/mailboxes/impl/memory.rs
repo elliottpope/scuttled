@@ -20,6 +20,7 @@ enum WriteCommand {
         oneshot::Sender<Result<MailboxInfo>>,
     ),
     Delete(String, String, oneshot::Sender<Result<()>>),
+    GetNextUid(String, String, oneshot::Sender<Result<Uid>>),
     UpdateNextUid(MailboxId, Uid, oneshot::Sender<Result<()>>),
     UpdateUidValidity(MailboxId, u32, oneshot::Sender<Result<()>>),
     UpdateCounts(MailboxId, u32, u32, u32, oneshot::Sender<Result<()>>),
@@ -80,6 +81,19 @@ impl MailboxState {
         if let Some(mailbox_info) = self.mailboxes.remove(&key) {
             self.id_to_key.remove(&mailbox_info.id);
             Ok(())
+        } else {
+            Err(Error::MailboxNotFound(name.to_string()))
+        }
+    }
+
+    /// Atomically get the next UID and increment it
+    fn get_next_uid(&mut self, username: &str, name: &str) -> Result<Uid> {
+        let key = (username.to_string(), name.to_string());
+
+        if let Some(mailbox_info) = self.mailboxes.get_mut(&key) {
+            let uid = mailbox_info.next_uid;
+            mailbox_info.next_uid += 1;
+            Ok(uid)
         } else {
             Err(Error::MailboxNotFound(name.to_string()))
         }
@@ -153,6 +167,11 @@ impl InMemoryMailboxes {
                 WriteCommand::Delete(username, name, reply) => {
                     let mut state = state.write().await;
                     let result = state.delete_mailbox(&username, &name);
+                    let _ = reply.send(result);
+                }
+                WriteCommand::GetNextUid(username, mailbox, reply) => {
+                    let mut state = state.write().await;
+                    let result = state.get_next_uid(&username, &mailbox);
                     let _ = reply.send(result);
                 }
                 WriteCommand::UpdateNextUid(id, next_uid, reply) => {
@@ -231,6 +250,21 @@ impl Mailboxes for InMemoryMailboxes {
             .filter(|((u, _), _)| u == username)
             .map(|(_, info)| info.clone())
             .collect())
+    }
+
+    async fn get_next_uid(&self, username: &str, mailbox: &str) -> Result<Uid> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::GetNextUid(
+                username.to_string(),
+                mailbox.to_string(),
+                tx,
+            ))
+            .await
+            .map_err(|_| Error::Internal("Failed to send get next UID command".to_string()))?;
+
+        rx.await
+            .map_err(|_| Error::Internal("Failed to receive get next UID response".to_string()))?
     }
 
     async fn update_next_uid(&self, id: &MailboxId, next_uid: Uid) -> Result<()> {
