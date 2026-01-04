@@ -1,363 +1,226 @@
 //! Storage layer for email messages
 //!
-//! This module provides a Copy/Clone storage handle for storing and retrieving
-//! raw email messages. The Storage struct wraps a channel-based writer loop
-//! for atomic write operations while allowing direct filesystem reads.
+//! This module provides a Copy/Clone storage handle that coordinates between:
+//! - StoreMail: Low-level file operations (write, move, remove)
+//! - MailboxFormat: Filename/metadata parsing and construction
 //!
 //! # Architecture
 //!
-//! Storage is designed to be Copy/Clone to avoid Arc<dyn Trait> overhead:
+//! Storage is generic over two traits to separate concerns:
+//! - `StoreMail` handles the actual file I/O (filesystem, S3, etc.)
+//! - `MailboxFormat` handles filename conventions (Maildir, mbox, etc.)
 //!
-//! ```ignore
-//! // Cheap to clone - just clones the channel sender
-//! let storage = Storage::new("./data/mail").await?;
-//! let storage_clone = storage.clone(); // No Arc needed!
-//! ```
+//! Both are Clone, making Storage cheap to clone without Arc overhead.
 //!
 //! # Usage
 //!
 //! ```ignore
-//! use scuttled::storage::Storage;
+//! use scuttled::storage::{Storage, FilesystemStore};
+//! use scuttled::mailstore::format::MaildirFormat;
 //!
-//! let storage = Storage::new("./data/mail").await?;
+//! let store = FilesystemStore::new("./data/mail").await?;
+//! let format = MaildirFormat;
+//! let storage = Storage::new(store, format);
+//!
+//! // Cheap to clone!
+//! let storage_clone = storage.clone();
 //!
 //! // Store a message
 //! storage.store("alice/INBOX/msg1.eml", b"From: ...").await?;
 //!
-//! // Retrieve a message
-//! let content = storage.retrieve("alice/INBOX/msg1.eml").await?;
-//!
-//! // Update flags (Maildir rename)
+//! // Update flags (uses MailboxFormat for filename)
 //! storage.update_flags("alice/INBOX/msg1.eml", &[MessageFlag::Seen]).await?;
-//!
-//! // Delete a message
-//! storage.delete("alice/INBOX/msg1.eml").await?;
 //! ```
 
-use async_std::channel::{bounded, Receiver, Sender};
-use async_std::fs::{self, File};
-use async_std::io::ReadExt;
-use async_std::path::{Path, PathBuf};
-use async_std::task;
-use futures::channel::oneshot;
-use log::debug;
+pub mod store_mail;
+pub mod filesystem_store;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
+use crate::mailstore::format::MailboxFormat;
 use crate::types::MessageFlag;
+use std::sync::Arc;
 
-/// Write commands for the storage (only writes go through the channel)
-#[derive(Debug)]
-enum StorageCommand {
-    Store {
-        path: String,
-        content: Vec<u8>,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Delete {
-        path: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    UpdateFlags {
-        path: String,
-        flags: Vec<MessageFlag>,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Shutdown {
-        reply: oneshot::Sender<()>,
-    },
-}
+pub use store_mail::StoreMail;
+pub use filesystem_store::FilesystemStore;
 
-/// Filesystem-based storage handle (cheap to clone)
+/// Storage coordinator (cheap to clone)
 ///
-/// This struct wraps a channel sender, making it cheap to clone and share
-/// across components without Arc overhead.
+/// Generic over:
+/// - S: StoreMail implementation (file operations)
+/// - F: MailboxFormat implementation (filename conventions)
 #[derive(Clone)]
-pub struct Storage {
-    /// Root directory for storage
-    root: PathBuf,
-    /// Write command sender (cheap to clone)
-    write_tx: Sender<StorageCommand>,
+pub struct Storage<S, F>
+where
+    S: StoreMail,
+    F: MailboxFormat,
+{
+    /// Low-level file storage (Clone via channel sender)
+    store: S,
+    /// Mailbox format handler (Clone via Arc for trait object)
+    format: Arc<F>,
 }
 
-impl Storage {
+impl<S, F> Storage<S, F>
+where
+    S: StoreMail,
+    F: MailboxFormat + 'static,
+{
     /// Create a new Storage instance
-    ///
-    /// This spawns a writer loop task and returns a handle that can be cloned cheaply.
-    pub async fn new<P: AsRef<Path>>(root_path: P) -> Result<Self> {
-        let root_path = root_path.as_ref().to_path_buf();
-        fs::create_dir_all(&root_path).await?;
-
-        let (write_tx, write_rx) = bounded(100);
-
-        // Spawn writer loop for write operations
-        let root_clone = root_path.clone();
-        task::spawn(storage_writer_loop(write_rx, root_clone));
-
-        debug!("Storage initialized at {:?}", root_path);
-
-        Ok(Self {
-            root: root_path,
-            write_tx,
-        })
+    pub fn new(store: S, format: F) -> Self {
+        Self {
+            store,
+            format: Arc::new(format),
+        }
     }
 
     /// Store a message at the given path
     pub async fn store(&self, path: &str, content: &[u8]) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(StorageCommand::Store {
-                path: path.to_string(),
-                content: content.to_vec(),
-                reply: tx,
-            })
-            .await
-            .map_err(|_| Error::Internal("Storage writer loop stopped".to_string()))?;
-        rx.await
-            .map_err(|_| Error::Internal("Storage writer loop dropped reply".to_string()))?
+        self.store.write(path, content).await
     }
 
     /// Retrieve a message from the given path
     pub async fn retrieve(&self, path: &str) -> Result<Option<Vec<u8>>> {
-        // Direct filesystem read - no channel needed
-        let full_path = self.root.join(path);
-
-        if !full_path.exists().await {
-            return Ok(None);
-        }
-
-        let mut file = File::open(&full_path).await?;
-        let mut content = Vec::new();
-        file.read_to_end(&mut content).await?;
-
-        Ok(Some(content))
+        self.store.read(path).await
     }
 
     /// Delete a message at the given path
     pub async fn delete(&self, path: &str) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(StorageCommand::Delete {
-                path: path.to_string(),
-                reply: tx,
-            })
-            .await
-            .map_err(|_| Error::Internal("Storage writer loop stopped".to_string()))?;
-        rx.await
-            .map_err(|_| Error::Internal("Storage writer loop dropped reply".to_string()))?
+        self.store.remove(path).await
     }
 
     /// Check if a message exists at the given path
     pub async fn exists(&self, path: &str) -> Result<bool> {
-        // Direct filesystem check - no channel needed
-        let full_path = self.root.join(path);
-        Ok(full_path.exists().await)
+        self.store.exists(path).await
     }
 
-    /// Update flags for a message (Maildir rename)
+    /// Update flags for a message
     ///
-    /// This renames the file to reflect new flags in the filename.
-    /// For Maildir format: moves between new/cur and updates flags suffix.
-    pub async fn update_flags(&self, path: &str, flags: &[MessageFlag]) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send(StorageCommand::UpdateFlags {
-                path: path.to_string(),
-                flags: flags.to_vec(),
-                reply: tx,
-            })
-            .await
-            .map_err(|_| Error::Internal("Storage writer loop stopped".to_string()))?;
-        rx.await
-            .map_err(|_| Error::Internal("Storage writer loop dropped reply".to_string()))?
+    /// This uses the MailboxFormat to construct the new filename with flags,
+    /// then uses StoreMail to atomically move the file.
+    pub async fn update_flags(&self, current_path: &str, flags: &[MessageFlag]) -> Result<()> {
+        // Use the format to determine the new filename
+        let flag_component = self.format.flags_to_filename_component(flags);
+
+        // Parse current path to get components
+        let path_obj = std::path::Path::new(current_path);
+        let filename = path_obj
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| crate::error::Error::Internal(format!("Invalid path: {}", current_path)))?;
+
+        // Extract unique ID (before :2, if present)
+        let unique_id = if let Some(idx) = filename.find(":2,") {
+            &filename[..idx]
+        } else {
+            filename
+        };
+
+        // Build new filename with flags
+        let new_filename = if flag_component.is_empty() {
+            unique_id.to_string()
+        } else {
+            format!("{}{}", unique_id, flag_component)
+        };
+
+        // Determine directory (new/ vs cur/ for Maildir)
+        let parent = path_obj.parent().unwrap_or(std::path::Path::new(""));
+        let parent_name = parent
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        // For Maildir: messages with Seen flag go to cur/, others to new/
+        let new_parent = if flags.iter().any(|f| matches!(f, MessageFlag::Seen)) {
+            if parent_name == "new" {
+                parent.parent().unwrap_or(parent).join("cur")
+            } else {
+                parent.to_path_buf()
+            }
+        } else {
+            if parent_name == "cur" {
+                parent.parent().unwrap_or(parent).join("new")
+            } else {
+                parent.to_path_buf()
+            }
+        };
+
+        let new_path = new_parent.join(new_filename);
+        let new_path_str = new_path.to_str()
+            .ok_or_else(|| crate::error::Error::Internal("Invalid path encoding".to_string()))?;
+
+        // Atomically move the file
+        self.store.move_file(current_path, new_path_str).await
     }
 
     /// Shutdown the storage gracefully
     pub async fn shutdown(&self) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.write_tx.send(StorageCommand::Shutdown { reply: tx }).await;
-        let _ = rx.await;
-        Ok(())
+        self.store.shutdown().await
     }
 
-    /// Get the root path of the storage
-    pub fn root_path(&self) -> &Path {
-        &self.root
-    }
-}
-
-/// Writer loop for storage operations
-///
-/// All write operations go through this loop to ensure ordering and atomicity.
-async fn storage_writer_loop(rx: Receiver<StorageCommand>, root_path: PathBuf) {
-    while let Ok(cmd) = rx.recv().await {
-        match cmd {
-            StorageCommand::Store { path, content, reply } => {
-                let result = store_file(&root_path, &path, &content).await;
-                let _ = reply.send(result);
-            }
-            StorageCommand::Delete { path, reply } => {
-                let result = delete_file(&root_path, &path).await;
-                let _ = reply.send(result);
-            }
-            StorageCommand::UpdateFlags { path, flags, reply } => {
-                let result = update_flags_file(&root_path, &path, &flags).await;
-                let _ = reply.send(result);
-            }
-            StorageCommand::Shutdown { reply } => {
-                debug!("Storage writer loop shutting down");
-                let _ = reply.send(());
-                break;
-            }
-        }
-    }
-}
-
-/// Store a file to disk
-async fn store_file(root: &Path, path: &str, content: &[u8]) -> Result<()> {
-    let full_path = root.join(path);
-
-    // Create parent directories if they don't exist
-    if let Some(parent) = full_path.parent() {
-        fs::create_dir_all(parent).await?;
+    /// Get a reference to the underlying store
+    pub fn get_store(&self) -> &S {
+        &self.store
     }
 
-    let mut file = File::create(&full_path).await?;
-    use async_std::io::WriteExt;
-    file.write_all(content).await?;
-    file.sync_all().await?; // Ensure data is written to disk
-    Ok(())
-}
-
-/// Delete a file from disk
-async fn delete_file(root: &Path, path: &str) -> Result<()> {
-    let full_path = root.join(path);
-
-    if !full_path.exists().await {
-        return Err(Error::NotFound(format!("File not found: {}", path)));
+    /// Get a reference to the format handler
+    pub fn get_format(&self) -> &F {
+        &self.format
     }
-
-    fs::remove_file(&full_path).await?;
-    Ok(())
-}
-
-/// Update flags for a file (Maildir rename)
-///
-/// Renames the file to include flag information in the filename.
-/// Maildir format: filename:2,FLAGS where FLAGS are single letters:
-/// - D = Draft
-/// - F = Flagged
-/// - P = Passed (forwarded)
-/// - R = Replied
-/// - S = Seen
-/// - T = Trashed (deleted)
-async fn update_flags_file(root: &Path, path: &str, flags: &[MessageFlag]) -> Result<()> {
-    let full_path = root.join(path);
-
-    if !full_path.exists().await {
-        return Err(Error::NotFound(format!("File not found: {}", path)));
-    }
-
-    // Convert flags to Maildir flag string
-    let flag_str = flags_to_maildir_string(flags);
-
-    // Parse the current path to get components
-    let path_obj = Path::new(path);
-    let filename = path_obj
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| Error::Internal(format!("Invalid path: {}", path)))?;
-
-    // Extract unique ID (before :2, if present)
-    let unique_id = if let Some(idx) = filename.find(":2,") {
-        &filename[..idx]
-    } else {
-        filename
-    };
-
-    // Build new filename with flags
-    let new_filename = if flag_str.is_empty() {
-        unique_id.to_string()
-    } else {
-        format!("{}:2,{}", unique_id, flag_str)
-    };
-
-    // Determine if we need to move between new/cur directories
-    let parent = path_obj.parent().unwrap_or(Path::new(""));
-    let parent_name = parent
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-
-    let new_parent = if flags.iter().any(|f| matches!(f, MessageFlag::Seen)) {
-        // Seen messages go in cur/
-        if parent_name == "new" {
-            parent.parent().unwrap_or(parent).join("cur")
-        } else {
-            parent.to_path_buf()
-        }
-    } else {
-        // Unseen messages go in new/
-        if parent_name == "cur" {
-            parent.parent().unwrap_or(parent).join("new")
-        } else {
-            parent.to_path_buf()
-        }
-    };
-
-    let new_path = new_parent.join(new_filename);
-    let new_full_path = root.join(&new_path);
-
-    // Create target directory if needed
-    if let Some(new_parent_full) = new_full_path.parent() {
-        fs::create_dir_all(new_parent_full).await?;
-    }
-
-    // Rename the file
-    fs::rename(&full_path, &new_full_path).await?;
-
-    debug!("Updated flags: {:?} -> {:?}", path, new_path);
-    Ok(())
-}
-
-/// Convert MessageFlags to Maildir flag string
-///
-/// Flags are alphabetically sorted as per Maildir spec.
-fn flags_to_maildir_string(flags: &[MessageFlag]) -> String {
-    let mut chars = Vec::new();
-
-    for flag in flags {
-        match flag {
-            MessageFlag::Draft => chars.push('D'),
-            MessageFlag::Flagged => chars.push('F'),
-            MessageFlag::Answered => chars.push('R'), // Replied
-            MessageFlag::Seen => chars.push('S'),
-            MessageFlag::Deleted => chars.push('T'), // Trashed
-            MessageFlag::Recent => {} // Not stored in filename (transient)
-            MessageFlag::Custom(_) => {} // Custom flags not supported in filename
-        }
-    }
-
-    // Sort alphabetically
-    chars.sort_unstable();
-    chars.into_iter().collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mailstore::format::MailboxFormat;
     use tempfile::TempDir;
+
+    // Simple test format that just appends flags
+    #[derive(Clone)]
+    struct TestFormat;
+
+    impl MailboxFormat for TestFormat {
+        fn parse_message_path(&self, _path: &std::path::Path, _root: &std::path::Path) -> Option<crate::mailstore::format::ParsedMessage> {
+            None
+        }
+
+        fn watch_subdirectories(&self) -> Vec<&'static str> {
+            vec!["new", "cur"]
+        }
+
+        fn flags_to_filename_component(&self, flags: &[MessageFlag]) -> String {
+            if flags.is_empty() {
+                String::new()
+            } else {
+                let mut chars = Vec::new();
+                for flag in flags {
+                    match flag {
+                        MessageFlag::Seen => chars.push('S'),
+                        MessageFlag::Flagged => chars.push('F'),
+                        _ => {}
+                    }
+                }
+                format!(":2,{}", chars.into_iter().collect::<String>())
+            }
+        }
+
+        fn is_valid_message_file(&self, _path: &std::path::Path) -> bool {
+            true
+        }
+    }
 
     #[async_std::test]
     async fn test_storage_creation() {
         let tmp_dir = TempDir::new().unwrap();
-        let storage = Storage::new(tmp_dir.path()).await.unwrap();
+        let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
+        let storage = Storage::new(store, TestFormat);
         storage.shutdown().await.unwrap();
     }
 
     #[async_std::test]
-    async fn test_store_and_retrieve() {
+    async fn test_storage_store_retrieve() {
         let tmp_dir = TempDir::new().unwrap();
-        let storage = Storage::new(tmp_dir.path()).await.unwrap();
+        let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
+        let storage = Storage::new(store, TestFormat);
 
         let content = b"Hello, World!";
         storage.store("test/msg.eml", content).await.unwrap();
@@ -369,9 +232,10 @@ mod tests {
     }
 
     #[async_std::test]
-    async fn test_delete() {
+    async fn test_storage_delete() {
         let tmp_dir = TempDir::new().unwrap();
-        let storage = Storage::new(tmp_dir.path()).await.unwrap();
+        let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
+        let storage = Storage::new(store, TestFormat);
 
         storage.store("test/msg.eml", b"content").await.unwrap();
         assert!(storage.exists("test/msg.eml").await.unwrap());
@@ -383,17 +247,18 @@ mod tests {
     }
 
     #[async_std::test]
-    async fn test_update_flags() {
+    async fn test_storage_update_flags() {
         let tmp_dir = TempDir::new().unwrap();
-        let storage = Storage::new(tmp_dir.path()).await.unwrap();
+        let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
+        let storage = Storage::new(store, TestFormat);
 
-        // Store message in new/ (unseen)
+        // Store message in new/
         storage
             .store("alice/INBOX/new/msg123", b"content")
             .await
             .unwrap();
 
-        // Mark as seen - should move to cur/ with :2,S flag
+        // Mark as seen - should move to cur/ with :2,S
         storage
             .update_flags("alice/INBOX/new/msg123", &[MessageFlag::Seen])
             .await
@@ -412,9 +277,10 @@ mod tests {
     }
 
     #[async_std::test]
-    async fn test_clone() {
+    async fn test_storage_clone() {
         let tmp_dir = TempDir::new().unwrap();
-        let storage1 = Storage::new(tmp_dir.path()).await.unwrap();
+        let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
+        let storage1 = Storage::new(store, TestFormat);
         let storage2 = storage1.clone(); // Cheap clone!
 
         storage1.store("test1.eml", b"from storage1").await.unwrap();
@@ -425,23 +291,5 @@ mod tests {
         assert!(storage2.exists("test1.eml").await.unwrap());
 
         storage1.shutdown().await.unwrap();
-    }
-
-    #[test]
-    fn test_flags_to_maildir_string() {
-        assert_eq!(flags_to_maildir_string(&[]), "");
-        assert_eq!(flags_to_maildir_string(&[MessageFlag::Seen]), "S");
-        assert_eq!(
-            flags_to_maildir_string(&[MessageFlag::Seen, MessageFlag::Flagged]),
-            "FS"
-        );
-        assert_eq!(
-            flags_to_maildir_string(&[
-                MessageFlag::Answered,
-                MessageFlag::Seen,
-                MessageFlag::Draft
-            ]),
-            "DRS"
-        );
     }
 }
