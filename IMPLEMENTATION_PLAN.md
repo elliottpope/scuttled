@@ -89,21 +89,29 @@ struct Storage {
 - [x] Implement flag updates via filesystem rename (Maildir cur/new convention)
 - [x] Make Storage struct Clone (wraps channel sender)
 - [x] Add all core methods: store, retrieve, delete, exists, update_flags
+- [x] Create StoreMail trait for file operations abstraction
+- [x] Create FilesystemStore implementation with channel-based writes
+- [x] Make Storage generic over StoreMail + MailboxFormat
 - [ ] Add streaming read support (return AsyncRead instead of Vec<u8>)
 - [ ] Update all references from Arc<dyn MailStore> to Storage
 
 **Files:**
-- `src/storage.rs` ✅ Created with full implementation
+- `src/storage.rs` ✅ Generic over StoreMail + MailboxFormat
+- `src/storage/store_mail.rs` ✅ Low-level file operations trait
+- `src/storage/filesystem_store.rs` ✅ Channel-based implementation
 - `src/mailstore/` - Kept for backward compatibility
 - `src/server.rs` - Update to use concrete Storage type (pending)
 - `src/session.rs` - Update references (pending)
 
 **Completion Notes:**
-- Storage struct is Clone with cheap channel sender clone
-- All 6 storage tests passing including flag updates
+- Storage is now generic: `Storage<S: StoreMail, F: MailboxFormat>`
+- StoreMail trait: write, move_file, remove, write_metadata, read, exists
+- FilesystemStore: Clone-able with channel-based writer loop
+- Clear separation: StoreMail (file I/O) vs MailboxFormat (filename conventions)
+- All 5 storage tests passing including flag updates
 - Maildir flag format fully implemented (D/F/R/S/T flags)
 - Atomic file operations with fsync
-- Commit: 53d8d49
+- Commits: 53d8d49, 964053c
 
 #### 1.2.2 Mailbox Redesign
 
@@ -119,26 +127,29 @@ struct Storage {
 - `src/mailbox.rs` (new file) - Shared Mailbox handle
 - `src/types.rs` - Keep MailboxMetadata struct for data
 
-#### 1.2.3 Searcher Creation
+#### 1.2.3 Searcher Creation ✅ **COMPLETE**
 
 **Tasks:**
-- [x] Create read-only Searcher struct wrapping Indexer
-- [x] Make Searcher Clone (wraps Arc<Indexer>)
-- [x] Implement basic search method
-- [ ] Implement full query-only API (list_mailboxes, etc.)
-- [ ] Add search optimization for common queries
+- [x] Create read-only Searcher struct (completely separate from Indexer)
+- [x] Create SearchBackend trait for read-only operations
+- [x] Make Searcher Clone (wraps Arc<dyn SearchBackend>)
+- [x] Implement full query API: search, list_mailboxes, message_count, mailbox_exists
+- [ ] Add search optimization for common queries (future)
+- [ ] Create SearchBackend implementation that wraps IndexBackend (future)
 
 **Files:**
-- `src/searcher.rs` ✅ Created with foundation
-- `src/index/indexer.rs` - No changes needed (read methods already public)
+- `src/searcher.rs` ✅ Complete read/write separation from Indexer
+- `src/index/indexer.rs` - No dependency (intentional separation)
 
 **Completion Notes:**
-- Searcher foundation complete with Clone implementation
-- Wraps Arc<Indexer> for cheap cloning
-- Basic search() method implemented
-- Full API expansion pending (needs alignment with Indexer interface)
-- 1 test passing
-- Commit: 53d8d49
+- **Full read/write separation achieved** - Searcher has NO dependency on Indexer
+- SearchBackend trait provides read-only query interface
+- Searcher wraps Arc<dyn SearchBackend> for cheap cloning
+- Complete API: search(), list_mailboxes(), message_count(), mailbox_exists()
+- MockSearchBackend for testing
+- 3 tests passing
+- Architecture enforces read-only access at compile time
+- Commits: 53d8d49, 964053c
 
 **Success Criteria:**
 - Storage, Mailbox, Searcher are all Clone
