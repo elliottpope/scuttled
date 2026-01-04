@@ -33,25 +33,33 @@ This plan outlines the refactoring of Scuttled from a trait-object-based archite
 
 ## Phase 1: Key Architectural Changes
 
-### 1.1 Events Enhancement (1-2 days)
+### 1.1 Events Enhancement (1-2 days) ✅ **COMPLETED**
 
 **Goal:** Support synchronous state changes with oneshot channels for consistency guarantees.
 
 **Tasks:**
-- [ ] Add oneshot channel support to EventBus for synchronous event handling
-- [ ] Implement async vs. sync subscription registration
-- [ ] Add event acknowledgment mechanism (subscribers send completion signals)
-- [ ] Add `publish_sync()` method that waits for all sync subscribers
-- [ ] Update EventBus documentation with sync/async patterns
+- [x] Add oneshot channel support to EventBus for synchronous event handling
+- [x] Implement async vs. sync subscription registration
+- [x] Add event acknowledgment mechanism (subscribers send completion signals)
+- [x] Add `publish_sync()` method that waits for all sync subscribers
+- [x] Update EventBus documentation with sync/async patterns
 
 **Files:**
-- `src/events.rs` - Add sync event support
-- Add tests for sync event handling
+- `src/events.rs` - Add sync event support ✅
+- Add tests for sync event handling ✅
 
 **Success Criteria:**
-- Publishers can wait for all synchronous subscribers to complete
-- Async subscribers don't block synchronous operations
-- No deadlocks in event handling
+- ✅ Publishers can wait for all synchronous subscribers to complete
+- ✅ Async subscribers don't block synchronous operations
+- ✅ No deadlocks in event handling
+
+**Completion Notes:**
+- Implemented `SubscriptionType` enum (Async/Sync)
+- Created `EventDelivery` wrapper with acknowledgment support
+- Added `subscribe_sync()` and `publish_sync()` methods
+- All 55 tests passing including 5 new sync event tests
+- Comprehensive documentation added to module
+- Commit: f94c5b1
 
 ---
 
