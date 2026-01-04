@@ -18,6 +18,7 @@ pub mod queue;
 pub mod authenticator;
 pub mod userstore;
 pub mod command_handler;
+pub mod command_handlers;
 pub mod session_context;
 pub mod mailboxes;
 pub mod session;
@@ -33,6 +34,7 @@ pub use queue::Queue;
 pub use authenticator::Authenticator;
 pub use userstore::UserStore;
 pub use command_handler::CommandHandler;
+pub use command_handlers::CommandHandlers;
 pub use session_context::{SessionContext, SessionState};
 pub use mailboxes::{Mailboxes, MailboxInfo};
 
