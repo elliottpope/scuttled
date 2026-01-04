@@ -258,7 +258,8 @@ async fn event_listener(
     );
 
     // Listen for events
-    while let Ok(event) = event_rx.recv().await {
+    while let Ok(delivery) = event_rx.recv().await {
+        let event = delivery.event().clone();
         match event {
             Event::MessageCreated {
                 username,
@@ -484,6 +485,9 @@ async fn event_listener(
                 // Ignore other events
             }
         }
+
+        // Acknowledge event processing (no-op for async subscriptions)
+        delivery.acknowledge();
     }
 
     info!("Event listener stopped");
