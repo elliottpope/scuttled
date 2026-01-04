@@ -1,59 +1,79 @@
 //! Read-only search interface for querying indexed messages
 //!
-//! The Searcher provides a Clone-able, read-only view of the Index for performing
-//! searches without allowing modifications. This is useful for components that only
-//! need to query the index but shouldn't be able to modify it.
+//! The Searcher provides a Clone-able, read-only interface for searching messages.
+//! It is completely separate from the Indexer (write interface) to enforce read/write separation.
 //!
 //! # Architecture
 //!
-//! Searcher wraps an Arc to the Indexer but only exposes search methods:
+//! Searcher is generic over a SearchBackend trait that provides read-only query operations:
 //!
 //! ```ignore
-//! use scuttled::searcher::Searcher;
+//! use scuttled::searcher::{Searcher, SearchBackend};
 //!
-//! // Create from an Indexer
-//! let searcher = Searcher::from_indexer(indexer);
+//! // Create with a search backend
+//! let searcher = Searcher::new(backend);
 //!
 //! // Cheap to clone
 //! let searcher_clone = searcher.clone();
 //!
 //! // Search for messages
-//! let results = searcher.search(&query).await?;
+//! let results = searcher.search("alice", "INBOX", &query).await?;
 //! ```
 //!
-//! # Usage
+//! # Read/Write Separation
 //!
-//! ```ignore
-//! // In a session or command handler
-//! let searcher = context.searcher();
+//! - **Searcher**: Read-only queries (this module)
+//! - **Indexer**: Write operations + event coordination (separate)
+//! - **Backend**: Underlying storage that both can reference
 //!
-//! // Search without worrying about modifying the index
-//! let messages = searcher.search(&SearchQuery {
-//!     username: "alice",
-//!     mailbox: "INBOX",
-//!     query: "subject:urgent",
-//! }).await?;
-//! ```
+//! This separation ensures that components with only read access
+//! cannot accidentally modify the index.
 
+use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::error::Result;
-use crate::index::Indexer;
 use crate::types::SearchQuery;
+
+/// Backend trait for read-only search operations
+///
+/// Implementations provide query capabilities without mutation.
+/// Both in-memory and persistent backends can implement this trait.
+#[async_trait]
+pub trait SearchBackend: Send + Sync {
+    /// Search for messages matching the query
+    ///
+    /// Returns paths to messages that match the search criteria.
+    async fn search(
+        &self,
+        username: &str,
+        mailbox: &str,
+        query: &SearchQuery,
+    ) -> Result<Vec<String>>;
+
+    /// List all mailboxes for a user
+    async fn list_mailboxes(&self, username: &str) -> Result<Vec<String>>;
+
+    /// Get message count for a mailbox
+    async fn message_count(&self, username: &str, mailbox: &str) -> Result<usize>;
+
+    /// Check if a mailbox exists
+    async fn mailbox_exists(&self, username: &str, mailbox: &str) -> Result<bool>;
+}
 
 /// Read-only search interface (cheap to clone)
 ///
-/// This struct provides a Clone-able, read-only view of the Index.
-/// It wraps an Arc<Indexer> internally, so cloning is cheap.
+/// This struct provides a Clone-able, read-only view for searching messages.
+/// It wraps a SearchBackend in an Arc, making cloning cheap.
 #[derive(Clone)]
 pub struct Searcher {
-    indexer: Arc<Indexer>,
+    backend: Arc<dyn SearchBackend>,
 }
 
 impl Searcher {
-    /// Create a new Searcher from an Indexer
-    pub fn from_indexer(indexer: Arc<Indexer>) -> Self {
-        Self { indexer }
+    /// Create a new Searcher from a SearchBackend
+    pub fn new(backend: Arc<dyn SearchBackend>) -> Self {
+        Self { backend }
     }
 
     /// Search for messages matching the query
@@ -65,25 +85,81 @@ impl Searcher {
         mailbox: &str,
         query: &SearchQuery,
     ) -> Result<Vec<String>> {
-        self.indexer.search(username, mailbox, query).await
+        self.backend.search(username, mailbox, query).await
     }
 
+    /// List all mailboxes for a user
+    pub async fn list_mailboxes(&self, username: &str) -> Result<Vec<String>> {
+        self.backend.list_mailboxes(username).await
+    }
+
+    /// Get message count for a mailbox
+    pub async fn message_count(&self, username: &str, mailbox: &str) -> Result<usize> {
+        self.backend.message_count(username, mailbox).await
+    }
+
+    /// Check if a mailbox exists
+    pub async fn mailbox_exists(&self, username: &str, mailbox: &str) -> Result<bool> {
+        self.backend.mailbox_exists(username, mailbox).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::backend::IndexBackend;
-    use crate::index::r#impl::inmemory::InMemoryBackend;
-    use crate::index::Indexer;
 
-    #[test]
-    fn test_searcher_creation() {
-        let backend = Box::new(InMemoryBackend::new()) as Box<dyn IndexBackend>;
-        let indexer = Indexer::new(backend, None);
-        let searcher = Searcher::from_indexer(Arc::new(indexer));
+    // Mock backend for testing
+    struct MockSearchBackend;
+
+    #[async_trait]
+    impl SearchBackend for MockSearchBackend {
+        async fn search(
+            &self,
+            _username: &str,
+            _mailbox: &str,
+            _query: &SearchQuery,
+        ) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn list_mailboxes(&self, _username: &str) -> Result<Vec<String>> {
+            Ok(vec!["INBOX".to_string()])
+        }
+
+        async fn message_count(&self, _username: &str, _mailbox: &str) -> Result<usize> {
+            Ok(0)
+        }
+
+        async fn mailbox_exists(&self, _username: &str, _mailbox: &str) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[async_std::test]
+    async fn test_searcher_creation() {
+        let backend = Arc::new(MockSearchBackend);
+        let searcher = Searcher::new(backend);
 
         // Searcher should be clone-able
         let _searcher_clone = searcher.clone();
+    }
+
+    #[async_std::test]
+    async fn test_searcher_search() {
+        let backend = Arc::new(MockSearchBackend);
+        let searcher = Searcher::new(backend);
+
+        let query = SearchQuery::All;
+        let results = searcher.search("alice", "INBOX", &query).await.unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[async_std::test]
+    async fn test_searcher_list_mailboxes() {
+        let backend = Arc::new(MockSearchBackend);
+        let searcher = Searcher::new(backend);
+
+        let mailboxes = searcher.list_mailboxes("alice").await.unwrap();
+        assert_eq!(mailboxes, vec!["INBOX"]);
     }
 }
