@@ -1,16 +1,15 @@
 //! Storage layer for email messages
 //!
 //! This module provides a Copy/Clone storage handle that coordinates between:
-//! - StoreMail: Low-level file operations (write, move, remove)
+//! - StoreMail: Low-level file operations (simple, direct I/O)
 //! - MailboxFormat: Filename/metadata parsing and construction
 //!
 //! # Architecture
 //!
-//! Storage is generic over two traits to separate concerns:
-//! - `StoreMail` handles the actual file I/O (filesystem, S3, etc.)
-//! - `MailboxFormat` handles filename conventions (Maildir, mbox, etc.)
-//!
-//! Both are Clone, making Storage cheap to clone without Arc overhead.
+//! Storage coordinates write operations via channels for atomicity:
+//! - StoreMail implementations are simple, direct file I/O (no channels)
+//! - Storage layer adds channel-based write coordination
+//! - MailboxFormat is lightweight and Clone-able
 //!
 //! # Usage
 //!
@@ -20,12 +19,12 @@
 //!
 //! let store = FilesystemStore::new("./data/mail").await?;
 //! let format = MaildirFormat;
-//! let storage = Storage::new(store, format);
+//! let storage = Storage::new(store, format).await?;
 //!
 //! // Cheap to clone!
 //! let storage_clone = storage.clone();
 //!
-//! // Store a message
+//! // Store a message (write-once via channel)
 //! storage.store("alice/INBOX/msg1.eml", b"From: ...").await?;
 //!
 //! // Update flags (uses MailboxFormat for filename)
@@ -35,68 +34,130 @@
 pub mod store_mail;
 pub mod filesystem_store;
 
-use crate::error::Result;
+use async_std::channel::{bounded, Receiver, Sender};
+use async_std::task;
+use futures::channel::oneshot;
+
+use crate::error::{Error, Result};
 use crate::mailstore::format::MailboxFormat;
 use crate::types::MessageFlag;
-use std::sync::Arc;
 
 pub use store_mail::StoreMail;
 pub use filesystem_store::FilesystemStore;
+
+/// Storage commands for the writer loop
+#[derive(Debug)]
+enum StorageCommand {
+    Write {
+        path: String,
+        content: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Move {
+        from: String,
+        to: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Remove {
+        path: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    WriteMetadata {
+        path: String,
+        metadata: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
+}
 
 /// Storage coordinator (cheap to clone)
 ///
 /// Generic over:
 /// - S: StoreMail implementation (file operations)
 /// - F: MailboxFormat implementation (filename conventions)
+///
+/// Coordinates channel-based writes for atomicity.
 #[derive(Clone)]
 pub struct Storage<S, F>
 where
     S: StoreMail,
-    F: MailboxFormat,
+    F: MailboxFormat + Clone,
 {
-    /// Low-level file storage (Clone via channel sender)
+    /// Low-level file storage (Clone, direct I/O)
     store: S,
-    /// Mailbox format handler (Clone via Arc for trait object)
-    format: Arc<F>,
+    /// Mailbox format handler (Clone, lightweight)
+    format: F,
+    /// Command sender for write coordination (Clone via channel)
+    command_tx: Sender<StorageCommand>,
 }
 
 impl<S, F> Storage<S, F>
 where
-    S: StoreMail,
-    F: MailboxFormat + 'static,
+    S: StoreMail + 'static,
+    F: MailboxFormat + Clone + Send + Sync + 'static,
 {
     /// Create a new Storage instance
-    pub fn new(store: S, format: F) -> Self {
-        Self {
-            store,
-            format: Arc::new(format),
-        }
+    ///
+    /// This spawns a writer loop task and returns a handle that can be cloned cheaply.
+    pub async fn new(store: S, format: F) -> Result<Self> {
+        let (command_tx, command_rx) = bounded(100);
+
+        // Spawn writer loop for write coordination
+        let store_clone = store.clone();
+        task::spawn(storage_writer_loop(command_rx, store_clone));
+
+        Ok(Self {
+            store: store.clone(),
+            format,
+            command_tx,
+        })
     }
 
-    /// Store a message at the given path
+    /// Store a message at the given path (write-once via channel)
     pub async fn store(&self, path: &str, content: &[u8]) -> Result<()> {
-        self.store.write(path, content).await
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(StorageCommand::Write {
+                path: path.to_string(),
+                content: content.to_vec(),
+                reply: tx,
+            })
+            .await
+            .map_err(|_| Error::Internal("Storage writer loop stopped".to_string()))?;
+        rx.await
+            .map_err(|_| Error::Internal("Storage writer loop dropped reply".to_string()))?
     }
 
-    /// Retrieve a message from the given path
+    /// Retrieve a message from the given path (direct read, no channel)
     pub async fn retrieve(&self, path: &str) -> Result<Option<Vec<u8>>> {
         self.store.read(path).await
     }
 
-    /// Delete a message at the given path
+    /// Delete a message at the given path (via channel)
     pub async fn delete(&self, path: &str) -> Result<()> {
-        self.store.remove(path).await
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(StorageCommand::Remove {
+                path: path.to_string(),
+                reply: tx,
+            })
+            .await
+            .map_err(|_| Error::Internal("Storage writer loop stopped".to_string()))?;
+        rx.await
+            .map_err(|_| Error::Internal("Storage writer loop dropped reply".to_string()))?
     }
 
-    /// Check if a message exists at the given path
+    /// Check if a message exists at the given path (direct read, no channel)
     pub async fn exists(&self, path: &str) -> Result<bool> {
         self.store.exists(path).await
     }
 
-    /// Update flags for a message
+    /// Update flags for a message (via channel)
     ///
     /// This uses the MailboxFormat to construct the new filename with flags,
-    /// then uses StoreMail to atomically move the file.
+    /// then coordinates the atomic move via the writer loop.
     pub async fn update_flags(&self, current_path: &str, flags: &[MessageFlag]) -> Result<()> {
         // Use the format to determine the new filename
         let flag_component = self.format.flags_to_filename_component(flags);
@@ -106,7 +167,7 @@ where
         let filename = path_obj
             .file_name()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| crate::error::Error::Internal(format!("Invalid path: {}", current_path)))?;
+            .ok_or_else(|| Error::Internal(format!("Invalid path: {}", current_path)))?;
 
         // Extract unique ID (before :2, if present)
         let unique_id = if let Some(idx) = filename.find(":2,") {
@@ -146,15 +207,28 @@ where
 
         let new_path = new_parent.join(new_filename);
         let new_path_str = new_path.to_str()
-            .ok_or_else(|| crate::error::Error::Internal("Invalid path encoding".to_string()))?;
+            .ok_or_else(|| Error::Internal("Invalid path encoding".to_string()))?;
 
-        // Atomically move the file
-        self.store.move_file(current_path, new_path_str).await
+        // Atomically move the file via writer loop
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(StorageCommand::Move {
+                from: current_path.to_string(),
+                to: new_path_str.to_string(),
+                reply: tx,
+            })
+            .await
+            .map_err(|_| Error::Internal("Storage writer loop stopped".to_string()))?;
+        rx.await
+            .map_err(|_| Error::Internal("Storage writer loop dropped reply".to_string()))?
     }
 
     /// Shutdown the storage gracefully
     pub async fn shutdown(&self) -> Result<()> {
-        self.store.shutdown().await
+        let (tx, rx) = oneshot::channel();
+        let _ = self.command_tx.send(StorageCommand::Shutdown { reply: tx }).await;
+        let _ = rx.await;
+        Ok(())
     }
 
     /// Get a reference to the underlying store
@@ -165,6 +239,37 @@ where
     /// Get a reference to the format handler
     pub fn get_format(&self) -> &F {
         &self.format
+    }
+}
+
+/// Writer loop for coordinating write operations
+///
+/// All write operations (store, move, remove) go through this loop
+/// to ensure ordering and atomicity.
+async fn storage_writer_loop<S: StoreMail>(rx: Receiver<StorageCommand>, store: S) {
+    while let Ok(cmd) = rx.recv().await {
+        match cmd {
+            StorageCommand::Write { path, content, reply } => {
+                let result = store.write(&path, &content).await;
+                let _ = reply.send(result);
+            }
+            StorageCommand::Move { from, to, reply } => {
+                let result = store.move_file(&from, &to).await;
+                let _ = reply.send(result);
+            }
+            StorageCommand::Remove { path, reply } => {
+                let result = store.remove(&path).await;
+                let _ = reply.send(result);
+            }
+            StorageCommand::WriteMetadata { path, metadata, reply } => {
+                let result = store.write_metadata(&path, &metadata).await;
+                let _ = reply.send(result);
+            }
+            StorageCommand::Shutdown { reply } => {
+                let _ = reply.send(());
+                break;
+            }
+        }
     }
 }
 
@@ -212,7 +317,7 @@ mod tests {
     async fn test_storage_creation() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
-        let storage = Storage::new(store, TestFormat);
+        let storage = Storage::new(store, TestFormat).await.unwrap();
         storage.shutdown().await.unwrap();
     }
 
@@ -220,7 +325,7 @@ mod tests {
     async fn test_storage_store_retrieve() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
-        let storage = Storage::new(store, TestFormat);
+        let storage = Storage::new(store, TestFormat).await.unwrap();
 
         let content = b"Hello, World!";
         storage.store("test/msg.eml", content).await.unwrap();
@@ -235,7 +340,7 @@ mod tests {
     async fn test_storage_delete() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
-        let storage = Storage::new(store, TestFormat);
+        let storage = Storage::new(store, TestFormat).await.unwrap();
 
         storage.store("test/msg.eml", b"content").await.unwrap();
         assert!(storage.exists("test/msg.eml").await.unwrap());
@@ -250,7 +355,7 @@ mod tests {
     async fn test_storage_update_flags() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
-        let storage = Storage::new(store, TestFormat);
+        let storage = Storage::new(store, TestFormat).await.unwrap();
 
         // Store message in new/
         storage
@@ -280,7 +385,7 @@ mod tests {
     async fn test_storage_clone() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
-        let storage1 = Storage::new(store, TestFormat);
+        let storage1 = Storage::new(store, TestFormat).await.unwrap();
         let storage2 = storage1.clone(); // Cheap clone!
 
         storage1.store("test1.eml", b"from storage1").await.unwrap();

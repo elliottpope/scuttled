@@ -63,11 +63,11 @@ This plan outlines the refactoring of Scuttled from a trait-object-based archite
 
 ---
 
-### 1.2 Copy/Clone Architecture for Shared Components (3-4 days) 🚧 **IN PROGRESS**
+### 1.2 Copy/Clone Architecture for Shared Components (3-4 days) ✅ **COMPLETE**
 
 **Goal:** Replace Arc<dyn Trait> with Copy/Clone concrete types for Storage, Searcher, and Mailbox.
 
-**Progress:** Storage and Searcher foundation complete. Remaining: Mailbox handle + Server migration.
+**Status:** All three core components (Storage, Searcher, Mailbox) now use Copy/Clone patterns with channel-based coordination.
 
 #### 1.2.1 Storage Redesign
 
@@ -113,19 +113,29 @@ struct Storage {
 - Atomic file operations with fsync
 - Commits: 53d8d49, 964053c
 
-#### 1.2.2 Mailbox Redesign
+#### 1.2.2 Mailbox Redesign ✅ **COMPLETE**
 
 **Tasks:**
-- [ ] Create new `Mailbox` struct as Copy/Clone shared handle
-- [ ] Implement internal channel-based state management
-- [ ] Add UID→path mapping storage
-- [ ] Add UID validity tracking
-- [ ] Add subscription management for unsolicited messages
-- [ ] Make Mailbox wrapping a sender channel (cheap clone)
+- [x] Create new `Mailbox` struct as Copy/Clone shared handle
+- [x] Implement internal channel-based state management
+- [x] Add UID→path mapping storage
+- [x] Add UID validity tracking
+- [x] Add subscription management for unsolicited messages
+- [x] Make Mailbox wrapping a sender channel (cheap clone)
 
 **Files:**
-- `src/mailbox.rs` (new file) - Shared Mailbox handle
-- `src/types.rs` - Keep MailboxMetadata struct for data
+- `src/mailbox.rs` ✅ Shared Mailbox handle
+- `src/lib.rs` ✅ Added exports for Mailbox, MailboxState, MailboxNotification
+
+**Completion Notes:**
+- Mailbox is Clone (wraps `Sender<MailboxCommand>`)
+- Channel-based state loop for atomic operations
+- Bidirectional UID↔path mapping (HashMap<Uid, String> and HashMap<String, Uid>)
+- UID validity and next UID tracking
+- Subscription management for IDLE/unsolicited notifications
+- Complete API: assign_uid(), get_path(), get_uid(), remove_message(), update_path(), get_state(), subscribe(), notify()
+- 9 comprehensive tests covering all functionality
+- All 76 tests passing (up from 67)
 
 #### 1.2.3 Searcher Creation ✅ **COMPLETE**
 
