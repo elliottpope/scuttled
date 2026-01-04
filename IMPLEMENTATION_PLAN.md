@@ -1,0 +1,521 @@
+# Scuttled Architecture Implementation Plan
+
+## Executive Summary
+
+This plan outlines the refactoring of Scuttled from a trait-object-based architecture (Arc<dyn Trait>) to a concrete-type architecture (Copy/Clone types) with enhanced event-driven communication.
+
+**Current State:** Well-architected async IMAP server with trait-based abstractions and channel-driven state management.
+
+**Target State:** Event-driven architecture with Copy/Clone shared components, eliminating Arc/RwLock overhead and improving performance.
+
+---
+
+## Architecture Comparison: Current vs. Proposed
+
+| Component | Current | Proposed | Gap Analysis |
+|-----------|---------|----------|--------------|
+| **Storage** | MailStore trait + FilesystemMailStore | Storage: path/key lookup, flag updates via rename/metadata | Need flag update support, rename from MailStore |
+| **StorageWatcher** | FilesystemWatcher (coupled to Index) | StorageWatcher: emit events on write/update/delete | Decouple from Index, make purely event-driven |
+| **Indexer** | Index trait + Indexer impl | Full text search, reconstructible from Storage | Ensure full reconstruction capability |
+| **Searcher** | ❌ Does not exist | Read-only Indexer | **NEW: Create read-only search interface** |
+| **Mailboxes** | Mailboxes trait + InMemoryMailboxes | Registry of mailboxes | Exists, convert to Copy/Clone |
+| **Mailbox** | Mailbox struct in types.rs | Shared state (UID→path, validity, subscriptions) | **NEW: Make Copy/Clone shared component** |
+| **Events** | EventBus with pub-sub | Core event bus with sync/async subscriptions | Add oneshot channel support for sync mutations |
+| **CommandHandlers** | CommandHandler trait only | CommandHandlers registry + CommandHandler | **NEW: Create registry/dispatcher** |
+| **Session** | Session struct with direct dispatch | Hands off TcpStream to handlers | Refactor for clean handler handoff |
+| **Connection** | Connection enum (Plain/TLS) | Plain or TLS TCP stream | ✅ Already exists |
+| **Server** | ImapServer struct | Starts loops, listeners, signals | Enhance signal handling |
+| **UserStore** | UserStore trait + SQLiteUserStore | Add ACLs, shared mailbox permissions | Add ACL/permissions support |
+| **Queue** | Queue trait + ChannelQueue | Async work queue | ✅ Already exists |
+| **Authenticator** | Authenticator trait + BasicAuthenticator | Handles authentication | ✅ Already exists |
+
+---
+
+## Phase 1: Key Architectural Changes
+
+### 1.1 Events Enhancement (1-2 days)
+
+**Goal:** Support synchronous state changes with oneshot channels for consistency guarantees.
+
+**Tasks:**
+- [ ] Add oneshot channel support to EventBus for synchronous event handling
+- [ ] Implement async vs. sync subscription registration
+- [ ] Add event acknowledgment mechanism (subscribers send completion signals)
+- [ ] Add `publish_sync()` method that waits for all sync subscribers
+- [ ] Update EventBus documentation with sync/async patterns
+
+**Files:**
+- `src/events.rs` - Add sync event support
+- Add tests for sync event handling
+
+**Success Criteria:**
+- Publishers can wait for all synchronous subscribers to complete
+- Async subscribers don't block synchronous operations
+- No deadlocks in event handling
+
+---
+
+### 1.2 Copy/Clone Architecture for Shared Components (3-4 days)
+
+**Goal:** Replace Arc<dyn Trait> with Copy/Clone concrete types for Storage, Searcher, and Mailbox.
+
+#### 1.2.1 Storage Redesign
+
+**Current Pattern:**
+```rust
+Arc<dyn MailStore> // Cloning increments refcount
+```
+
+**Target Pattern:**
+```rust
+#[derive(Clone)]
+struct Storage {
+    tx: Sender<StorageCommand>, // Cheap to clone
+}
+```
+
+**Tasks:**
+- [ ] Rename MailStore → Storage throughout codebase
+- [ ] Implement flag updates via filesystem rename (Maildir cur/new convention)
+- [ ] Make Storage struct Clone (wraps channel sender)
+- [ ] Add streaming read support (return AsyncRead instead of Vec<u8>)
+- [ ] Update all references from Arc<dyn MailStore> to Storage
+
+**Files:**
+- `src/storage/mod.rs` (rename from mailstore)
+- `src/storage/impl/filesystem.rs`
+- `src/server.rs` - Update to use concrete Storage type
+- `src/session.rs` - Update references
+
+#### 1.2.2 Mailbox Redesign
+
+**Tasks:**
+- [ ] Create new `Mailbox` struct as Copy/Clone shared handle
+- [ ] Implement internal channel-based state management
+- [ ] Add UID→path mapping storage
+- [ ] Add UID validity tracking
+- [ ] Add subscription management for unsolicited messages
+- [ ] Make Mailbox wrapping a sender channel (cheap clone)
+
+**Files:**
+- `src/mailbox.rs` (new file) - Shared Mailbox handle
+- `src/types.rs` - Keep MailboxMetadata struct for data
+
+#### 1.2.3 Searcher Creation
+
+**Tasks:**
+- [ ] Create read-only Searcher struct wrapping Indexer
+- [ ] Implement query-only methods (no mutation)
+- [ ] Make Searcher Clone (wraps reference to Indexer)
+- [ ] Add search optimization for common queries
+
+**Files:**
+- `src/searcher.rs` (new file)
+- `src/index/indexer.rs` - Refactor to support read-only access
+
+**Success Criteria:**
+- Storage, Mailbox, Searcher are all Clone
+- No Arc or RwLock in public APIs of these types
+- Performance improvement from reduced atomic operations
+
+---
+
+### 1.3 StorageWatcher Decoupling (2 days)
+
+**Goal:** Fully decouple FilesystemWatcher from Index, make it purely event-driven.
+
+**Tasks:**
+- [ ] Remove direct Index dependency from FilesystemWatcher
+- [ ] Emit events for: file write, rename (flag update), delete
+- [ ] Update event types to include full metadata (path, flags, etc.)
+- [ ] Make Indexer subscribe to storage events
+- [ ] Test event flow: StorageWatcher → EventBus → Indexer
+
+**Files:**
+- `src/storage/watcher/filesystem.rs` (rename from mailstore/watcher)
+- `src/events.rs` - Add new event types if needed
+- `src/index/indexer.rs` - Subscribe to storage events
+
+**Success Criteria:**
+- FilesystemWatcher has zero knowledge of Index
+- All communication via EventBus
+- Events contain sufficient data for Index to update itself
+
+---
+
+### 1.4 CommandHandlers Registry (2-3 days)
+
+**Goal:** Create centralized command handler registry for extensibility.
+
+**Tasks:**
+- [ ] Create CommandHandlers struct with HashMap<&str, Arc<dyn CommandHandler>>
+- [ ] Implement registration API: `register_handler(name, handler)`
+- [ ] Move command dispatch logic from Session to CommandHandlers
+- [ ] Update Session to borrow TcpStream and hand to handlers
+- [ ] Implement built-in handlers as separate modules:
+  - LoginHandler
+  - SelectHandler
+  - FetchHandler
+  - SearchHandler
+  - StoreHandler
+  - etc.
+
+**Files:**
+- `src/command_handlers.rs` (new file) - Registry
+- `src/handlers/` (new directory)
+  - `mod.rs` - Export all handlers
+  - `login.rs`, `select.rs`, `fetch.rs`, etc.
+- `src/session.rs` - Delegate to CommandHandlers
+- `src/server.rs` - Initialize CommandHandlers
+
+**Success Criteria:**
+- Session no longer has command-specific logic
+- Adding new commands only requires implementing CommandHandler
+- Handlers borrow TcpStream for request/response lifecycle
+
+---
+
+## Phase 2: Broader Refactoring
+
+### 2.1 Session Refactoring (2 days)
+
+**Goal:** Simplify Session to focus on connection lifecycle, tags, and sequence ID mapping.
+
+**Tasks:**
+- [ ] Remove command parsing logic (delegate to CommandHandlers)
+- [ ] Keep: tag tracking, idle timeout, max connection time
+- [ ] Keep: SequenceId bidirectional map
+- [ ] Simplify state management (use Events for state changes)
+- [ ] Add clean TcpStream handoff to handlers
+
+**Files:**
+- `src/session.rs` - Simplify
+- `src/session_context.rs` - May merge into session.rs
+
+---
+
+### 2.2 Server Enhancement (2 days)
+
+**Goal:** Improve signal handling and startup/shutdown orchestration.
+
+**Tasks:**
+- [ ] Add graceful shutdown for SIGTERM/SIGINT
+- [ ] Coordinate EventBus startup
+- [ ] Add health check endpoint (optional)
+- [ ] Improve TLS configuration (support multiple cert sources)
+- [ ] Add metrics collection hooks (optional)
+
+**Files:**
+- `src/server.rs`
+- `src/bin/main.rs` - Update initialization
+
+---
+
+### 2.3 UserStore ACL Enhancement (2-3 days)
+
+**Goal:** Add support for ACLs and shared mailbox permissions.
+
+**Tasks:**
+- [ ] Design ACL schema (user → mailbox → permissions)
+- [ ] Add ACL tables to SQLite schema
+- [ ] Implement permission checking in UserStore
+- [ ] Add methods: `grant_permission()`, `revoke_permission()`, `check_permission()`
+- [ ] Add shared mailbox metadata
+
+**Files:**
+- `src/userstore/mod.rs` - Add ACL methods to trait
+- `src/userstore/impl/sqlite.rs` - Implement ACL storage
+- Add migration support for schema changes
+
+---
+
+### 2.4 Indexer Reconstruction (2 days)
+
+**Goal:** Ensure Indexer can be fully reconstructed from Storage.
+
+**Tasks:**
+- [ ] Implement `rebuild_from_storage(storage: &Storage)` method
+- [ ] Walk all files in Storage
+- [ ] Re-parse message metadata
+- [ ] Rebuild UID mappings via Mailboxes
+- [ ] Rebuild full-text search index (if Tantivy backend)
+- [ ] Add progress reporting for large rebuilds
+
+**Files:**
+- `src/index/indexer.rs`
+- Add integration test for rebuild
+
+---
+
+### 2.5 Flag Updates via Filesystem (2 days)
+
+**Goal:** Support IMAP flag updates via Maildir-style renames.
+
+**Maildir Convention:**
+- `new/` directory: Unread messages
+- `cur/` directory: Read messages with flags in filename
+- Filename format: `unique-id:2,FLAGS` (FLAGS = DFPRST)
+
+**Tasks:**
+- [ ] Implement flag → filename encoding (e.g., `:2,S` for Seen)
+- [ ] Implement rename operation in Storage
+- [ ] Update StorageWatcher to detect renames and emit events
+- [ ] Update Indexer to handle flag update events
+- [ ] Add atomic rename support (ensure no race conditions)
+
+**Files:**
+- `src/storage/impl/filesystem.rs` - Add rename logic
+- `src/storage/watcher/maildir.rs` - Already exists, enhance
+- `src/types.rs` - Add flag encoding utilities
+
+---
+
+## Phase 3: Testing & Bug Fixes
+
+### 3.1 Unit Testing (3-4 days)
+
+**High-Priority Test Coverage:**
+
+- [ ] Storage: Write, read, delete, flag updates, streaming
+- [ ] StorageWatcher: Event emission on all operations
+- [ ] EventBus: Sync/async subscriptions, oneshot channels
+- [ ] Mailbox: UID assignment, path mapping, validity
+- [ ] Searcher: Read-only operations, query optimization
+- [ ] CommandHandlers: Registration, dispatch, handler lifecycle
+- [ ] Session: Tag tracking, sequence ID mapping, timeouts
+
+**Test Organization:**
+```
+tests/
+├── unit/
+│   ├── storage.rs
+│   ├── events.rs
+│   ├── mailbox.rs
+│   ├── searcher.rs
+│   └── command_handlers.rs
+```
+
+---
+
+### 3.2 Integration Testing (3-4 days)
+
+**Critical Integration Paths:**
+
+- [ ] End-to-end IMAP session (LOGIN → SELECT → FETCH → LOGOUT)
+- [ ] Storage → Watcher → EventBus → Indexer flow
+- [ ] Concurrent sessions accessing same mailbox
+- [ ] Flag updates propagating through system
+- [ ] Mailbox creation/deletion with event propagation
+- [ ] Authentication flow with UserStore
+- [ ] TLS connection upgrade (STARTTLS)
+
+**Test Organization:**
+```
+tests/
+├── integration/
+│   ├── imap_session.rs
+│   ├── event_flow.rs
+│   ├── concurrent_access.rs
+│   └── tls.rs
+```
+
+---
+
+### 3.3 Performance Testing (2 days)
+
+**Benchmarks:**
+
+- [ ] Message indexing throughput (messages/sec)
+- [ ] Search query latency (p50, p95, p99)
+- [ ] Concurrent session capacity
+- [ ] Memory usage under load
+- [ ] Storage I/O performance
+
+**Tools:**
+- Criterion.rs for benchmarking
+- Memory profiling with valgrind/heaptrack
+
+**Test Organization:**
+```
+benches/
+├── indexing.rs
+├── search.rs
+├── concurrent_sessions.rs
+└── storage_io.rs
+```
+
+---
+
+### 3.4 Bug Fixes & Edge Cases (2-3 days)
+
+**Known Areas to Investigate:**
+
+- [ ] Race conditions in event handling
+- [ ] UID validity handling on mailbox recreation
+- [ ] Partial writes/reads in Storage
+- [ ] Connection timeout edge cases
+- [ ] TLS handshake failures
+- [ ] Large message handling (>10MB)
+- [ ] Special characters in mailbox names
+- [ ] Concurrent flag updates on same message
+
+**Process:**
+1. Reproduce issue with failing test
+2. Fix implementation
+3. Verify test passes
+4. Add regression test
+
+---
+
+## Phase 4: Documentation & Cleanup
+
+### 4.1 Architecture Documentation (1-2 days)
+
+**Tasks:**
+- [ ] Update ARCHITECTURE.md with new design
+- [ ] Document Copy/Clone pattern rationale
+- [ ] Document event-driven communication patterns
+- [ ] Add sequence diagrams for key flows
+- [ ] Document extension points (custom commands, storage backends)
+
+---
+
+### 4.2 API Documentation (1 day)
+
+**Tasks:**
+- [ ] Add rustdoc comments to all public APIs
+- [ ] Document trait methods with examples
+- [ ] Document event types and their payloads
+- [ ] Add module-level documentation
+- [ ] Generate docs with `cargo doc --no-deps --open`
+
+---
+
+### 4.3 Code Cleanup (1 day)
+
+**Tasks:**
+- [ ] Remove deprecated code (old trait references)
+- [ ] Run clippy and fix warnings: `cargo clippy --all-targets`
+- [ ] Format code: `cargo fmt`
+- [ ] Remove unused dependencies from Cargo.toml
+- [ ] Update dependency versions
+
+---
+
+## Timeline Summary
+
+| Phase | Estimated Duration | Priority |
+|-------|-------------------|----------|
+| **Phase 1: Key Architectural Changes** | 10-13 days | CRITICAL |
+| 1.1 Events Enhancement | 1-2 days | HIGH |
+| 1.2 Copy/Clone Architecture | 3-4 days | CRITICAL |
+| 1.3 StorageWatcher Decoupling | 2 days | HIGH |
+| 1.4 CommandHandlers Registry | 2-3 days | MEDIUM |
+| **Phase 2: Broader Refactoring** | 10-11 days | HIGH |
+| 2.1 Session Refactoring | 2 days | MEDIUM |
+| 2.2 Server Enhancement | 2 days | LOW |
+| 2.3 UserStore ACL Enhancement | 2-3 days | LOW |
+| 2.4 Indexer Reconstruction | 2 days | MEDIUM |
+| 2.5 Flag Updates via Filesystem | 2 days | HIGH |
+| **Phase 3: Testing & Bug Fixes** | 10-13 days | CRITICAL |
+| 3.1 Unit Testing | 3-4 days | CRITICAL |
+| 3.2 Integration Testing | 3-4 days | CRITICAL |
+| 3.3 Performance Testing | 2 days | MEDIUM |
+| 3.4 Bug Fixes & Edge Cases | 2-3 days | HIGH |
+| **Phase 4: Documentation & Cleanup** | 3-4 days | MEDIUM |
+| 4.1 Architecture Documentation | 1-2 days | MEDIUM |
+| 4.2 API Documentation | 1 day | MEDIUM |
+| 4.3 Code Cleanup | 1 day | LOW |
+| **TOTAL** | **33-41 days** | |
+
+---
+
+## Risk Assessment
+
+### High-Risk Items
+
+1. **Copy/Clone Architecture Migration (1.2)**
+   - **Risk:** Breaking existing code, performance regressions
+   - **Mitigation:** Incremental migration, comprehensive benchmarking, keep trait abstractions temporarily
+
+2. **Event-Driven Synchronization (1.1)**
+   - **Risk:** Deadlocks, race conditions in event handling
+   - **Mitigation:** Thorough testing, async subscriber opt-out mechanism, timeout on sync events
+
+3. **Flag Updates via Rename (2.5)**
+   - **Risk:** Data loss during renames, inconsistent state
+   - **Mitigation:** Atomic operations, fsync guarantees, rollback mechanism
+
+### Medium-Risk Items
+
+1. **CommandHandlers Registry (1.4)**
+   - **Risk:** Breaking existing command handling logic
+   - **Mitigation:** Incremental migration per command, integration tests
+
+2. **Indexer Reconstruction (2.4)**
+   - **Risk:** Long rebuild times, memory exhaustion
+   - **Mitigation:** Streaming reconstruction, progress reporting, memory limits
+
+---
+
+## Success Metrics
+
+### Performance Goals
+- [ ] 10% reduction in memory usage (fewer Arc/RwLock allocations)
+- [ ] 15% improvement in message indexing throughput
+- [ ] Sub-100ms p95 search query latency
+- [ ] Support 100+ concurrent sessions
+
+### Code Quality Goals
+- [ ] 80%+ test coverage on core components
+- [ ] Zero clippy warnings
+- [ ] All public APIs documented
+- [ ] Clean architecture diagram
+
+### Functional Goals
+- [ ] All IMAP4rev1 commands working
+- [ ] Flag updates persisted correctly
+- [ ] EventBus handles sync/async subscriptions
+- [ ] Indexer can rebuild from Storage
+- [ ] ACLs enforce permissions
+
+---
+
+## Dependencies & Assumptions
+
+### Dependencies
+- Rust 1.70+ (async traits, GATs)
+- async_std runtime
+- Existing test infrastructure
+
+### Assumptions
+- Maildir format for flag storage acceptable
+- Single-node deployment (no distributed coordination needed)
+- SQLite sufficient for UserStore (no Postgres needed yet)
+- EventBus doesn't need persistent event log
+
+---
+
+## Next Steps
+
+1. **Review & Approval:** Stakeholder sign-off on plan
+2. **Branch Creation:** Create feature branch for each phase
+3. **Begin Phase 1.1:** Events enhancement (foundation for everything)
+4. **Daily Standups:** Track progress, adjust timeline
+5. **Weekly Demos:** Show working increments
+
+---
+
+## Open Questions
+
+1. Should Storage support multiple backends (S3, etc.) or just filesystem?
+2. Do we need distributed UID coordination for multi-node deployments?
+3. Should EventBus support persistent event log for crash recovery?
+4. What's the migration path for existing deployments (data format changes)?
+5. Should we implement IMAP IDLE extension during this refactor?
+
+---
+
+**Document Version:** 1.0
+**Last Updated:** 2026-01-04
+**Author:** Claude (Architecture Review Agent)
