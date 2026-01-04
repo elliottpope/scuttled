@@ -168,26 +168,37 @@ struct Storage {
 
 ---
 
-### 1.3 StorageWatcher Decoupling (2 days)
+### 1.3 StorageWatcher Decoupling (2 days) ✅ **COMPLETE**
 
 **Goal:** Fully decouple FilesystemWatcher from Index, make it purely event-driven.
 
 **Tasks:**
-- [ ] Remove direct Index dependency from FilesystemWatcher
-- [ ] Emit events for: file write, rename (flag update), delete
-- [ ] Update event types to include full metadata (path, flags, etc.)
-- [ ] Make Indexer subscribe to storage events
-- [ ] Test event flow: StorageWatcher → EventBus → Indexer
+- [x] Remove direct Index dependency from FilesystemWatcher
+- [x] Emit events for: file write, rename (flag update), delete
+- [x] Update event types to include full metadata (path, flags, etc.)
+- [x] Make Indexer subscribe to storage events
+- [x] Test event flow: StorageWatcher → EventBus → Indexer
 
 **Files:**
-- `src/storage/watcher/filesystem.rs` (rename from mailstore/watcher)
-- `src/events.rs` - Add new event types if needed
-- `src/index/indexer.rs` - Subscribe to storage events
+- `src/mailstore/watcher/filesystem.rs` ✅ Event-driven watcher (location unchanged)
+- `src/events.rs` ✅ Events: MessageCreated, MessageModified, MessageDeleted
+- `src/index/indexer.rs` ✅ Subscribes to storage events
+
+**Completion Notes:**
+- **This phase was already complete from prior work!**
+- FilesystemWatcher has ZERO direct Index dependency
+- All communication flows through EventBus exclusively
+- Events include full metadata: username, mailbox, unique_id, path, flags, from, to, subject, body_preview, size, internal_date
+- Indexer subscribes to MessageCreated, MessageModified, MessageDeleted, and MailboxDeleted events
+- Event loop processes filesystem changes and publishes to EventBus
+- Email parsing extracts headers (from, to, subject) and body preview
+- Test `test_event_bus_integration` verifies full event flow
+- All 76 tests passing
 
 **Success Criteria:**
-- FilesystemWatcher has zero knowledge of Index
-- All communication via EventBus
-- Events contain sufficient data for Index to update itself
+- ✅ FilesystemWatcher has zero knowledge of Index
+- ✅ All communication via EventBus
+- ✅ Events contain sufficient data for Index to update itself
 
 ---
 
