@@ -1,20 +1,17 @@
 //! StoreMail trait for low-level file operations
 //!
-//! This trait defines the basic file operations needed for email storage:
-//! - write: Create or overwrite a file
-//! - move_file: Rename/move a file atomically
-//! - remove: Delete a file
-//! - write_metadata: Update file metadata (for flag storage)
+//! Implementations should be simple, direct file I/O without channels.
+//! The Storage layer coordinates channel-based writes.
 
 use async_trait::async_trait;
 use crate::error::Result;
 
 /// Trait for basic file operations on email storage
 ///
-/// Implementations should handle:
-/// - Atomic operations
-/// - Directory creation
-/// - Error handling
+/// Implementations should be simple, direct file I/O.
+/// Examples: filesystem operations, S3 API calls, etc.
+///
+/// The Storage layer handles write coordination via channels.
 #[async_trait]
 pub trait StoreMail: Send + Sync + Clone {
     /// Write content to a file at the given path
@@ -47,7 +44,4 @@ pub trait StoreMail: Send + Sync + Clone {
     ///
     /// Returns None if the file doesn't exist.
     async fn read(&self, path: &str) -> Result<Option<Vec<u8>>>;
-
-    /// Shutdown the storage backend gracefully
-    async fn shutdown(&self) -> Result<()>;
 }
