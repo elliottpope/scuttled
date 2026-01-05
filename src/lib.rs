@@ -19,6 +19,7 @@ pub mod authenticator;
 pub mod userstore;
 pub mod command_handler;
 pub mod command_handlers;
+pub mod handlers;
 pub mod session_context;
 pub mod mailboxes;
 pub mod session;
