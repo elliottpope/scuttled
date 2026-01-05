@@ -1,7 +1,101 @@
 //! Global event system for inter-component communication
 //!
 //! This module provides a publish-subscribe event bus that allows components
-//! to communicate asynchronously through events.
+//! to communicate through events with both asynchronous (fire-and-forget) and
+//! synchronous (wait-for-acknowledgment) delivery modes.
+//!
+//! # Event Bus Architecture
+//!
+//! The EventBus supports two subscription modes:
+//!
+//! ## Async Subscriptions (Default)
+//!
+//! Async subscribers receive events without blocking the publisher. This is the
+//! default mode and is suitable for most use cases where the publisher doesn't
+//! need to wait for event processing to complete.
+//!
+//! ```ignore
+//! use scuttled::events::{EventBus, EventKind};
+//!
+//! let bus = EventBus::new();
+//!
+//! // Subscribe asynchronously
+//! let (sub_id, mut rx) = bus.subscribe(vec![EventKind::MessageCreated]).await?;
+//!
+//! // Handle events in background
+//! task::spawn(async move {
+//!     while let Ok(delivery) = rx.recv().await {
+//!         // Process event
+//!         println!("Received: {:?}", delivery.event());
+//!         // No acknowledgment needed for async
+//!     }
+//! });
+//!
+//! // Publish (returns immediately)
+//! bus.publish(Event::MessageCreated { ... }).await?;
+//! ```
+//!
+//! ## Sync Subscriptions
+//!
+//! Sync subscribers must acknowledge event processing before the publisher continues.
+//! This ensures that critical state changes are fully propagated before the caller proceeds.
+//!
+//! ```ignore
+//! use scuttled::events::{EventBus, EventKind, Event};
+//!
+//! let bus = EventBus::new();
+//!
+//! // Subscribe synchronously
+//! let (sub_id, mut rx) = bus.subscribe_sync(vec![EventKind::MailboxCreated]).await?;
+//!
+//! // Handle events and acknowledge
+//! task::spawn(async move {
+//!     while let Ok(delivery) = rx.recv().await {
+//!         // Process event
+//!         update_index(delivery.event()).await;
+//!         // MUST acknowledge for sync subscriptions
+//!         delivery.acknowledge();
+//!     }
+//! });
+//!
+//! // Publish and wait for all sync subscribers
+//! bus.publish_sync(Event::MailboxCreated {
+//!     username: "alice".to_string(),
+//!     mailbox: "INBOX".to_string(),
+//! }).await?;
+//! // At this point, all sync subscribers have processed the event
+//! ```
+//!
+//! ## Mixed Subscriptions
+//!
+//! You can have both sync and async subscribers for the same event:
+//!
+//! - `publish()`: Delivers to all subscribers but doesn't wait for acknowledgment
+//! - `publish_sync()`: Delivers to all subscribers and waits only for sync subscribers to acknowledge
+//!
+//! ## Event Delivery Modes
+//!
+//! Events are wrapped in `EventDelivery` enum:
+//! - `EventDelivery::Async(event)`: Fire-and-forget delivery
+//! - `EventDelivery::Sync { event, ack }`: Requires acknowledgment via oneshot channel
+//!
+//! ## Guidelines
+//!
+//! Use **async subscriptions** when:
+//! - Event processing is independent of the publisher's flow
+//! - Fire-and-forget semantics are acceptable
+//! - You want to minimize latency in the publisher
+//!
+//! Use **sync subscriptions** when:
+//! - State changes must be fully propagated before continuing
+//! - You need consistency guarantees (e.g., Index must update before query)
+//! - Critical operations require confirmation
+//!
+//! ## Performance Considerations
+//!
+//! - Async subscriptions have minimal overhead (channel send only)
+//! - Sync subscriptions block the publisher until all subscribers acknowledge
+//! - Mix subscription types carefully to balance latency and consistency
 
 use async_std::channel::{bounded, Receiver, Sender};
 use async_std::task;
@@ -14,6 +108,48 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use crate::types::MessageFlag;
+
+/// Subscription type - determines how events are delivered
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionType {
+    /// Async subscription - events are delivered without waiting for acknowledgment
+    /// Subscribers process events in the background
+    Async,
+    /// Sync subscription - event publisher waits for subscriber to acknowledge
+    /// Use this when state changes must be fully propagated before continuing
+    Sync,
+}
+
+/// Event delivery wrapper for subscribers
+/// Sync subscribers receive events with an acknowledgment channel
+#[derive(Debug)]
+pub enum EventDelivery {
+    /// Async event delivery - no acknowledgment needed
+    Async(Event),
+    /// Sync event delivery - subscriber must send acknowledgment when done
+    Sync {
+        event: Event,
+        ack: oneshot::Sender<()>,
+    },
+}
+
+impl EventDelivery {
+    /// Get the inner event regardless of delivery type
+    pub fn event(&self) -> &Event {
+        match self {
+            EventDelivery::Async(event) => event,
+            EventDelivery::Sync { event, .. } => event,
+        }
+    }
+
+    /// Acknowledge processing (only for sync events)
+    /// For async events, this is a no-op
+    pub fn acknowledge(self) {
+        if let EventDelivery::Sync { ack, .. } = self {
+            let _ = ack.send(());
+        }
+    }
+}
 
 /// Event types that can occur in the system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,15 +245,21 @@ impl SubscriptionId {
 
 /// Commands for the event bus
 enum BusCommand {
-    /// Publish an event
+    /// Publish an event (async - fire and forget)
     Publish {
+        event: Event,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Publish an event and wait for all sync subscribers to acknowledge
+    PublishSync {
         event: Event,
         reply: oneshot::Sender<Result<()>>,
     },
     /// Subscribe to specific event kinds
     Subscribe {
         kinds: Vec<EventKind>,
-        subscriber: Sender<Event>,
+        subscription_type: SubscriptionType,
+        subscriber: Sender<EventDelivery>,
         reply: oneshot::Sender<Result<SubscriptionId>>,
     },
     /// Unsubscribe from events
@@ -132,7 +274,8 @@ enum BusCommand {
 /// Internal subscriber information
 struct Subscriber {
     kinds: Vec<EventKind>,
-    sender: Sender<Event>,
+    subscription_type: SubscriptionType,
+    sender: Sender<EventDelivery>,
 }
 
 /// Global event bus for system-wide pub-sub
@@ -153,7 +296,11 @@ impl EventBus {
         Self { command_tx }
     }
 
-    /// Publish an event to all interested subscribers
+    /// Publish an event to all interested subscribers (async - fire and forget)
+    ///
+    /// This method returns immediately after dispatching the event.
+    /// Async subscribers receive the event but don't block the publisher.
+    /// Sync subscribers receive the event but the publisher doesn't wait for acknowledgment.
     pub async fn publish(&self, event: Event) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
@@ -165,16 +312,62 @@ impl EventBus {
             .map_err(|_| Error::Internal("Event bus dropped reply".to_string()))?
     }
 
-    /// Subscribe to specific event kinds
+    /// Publish an event and wait for all sync subscribers to acknowledge processing
     ///
-    /// Returns a subscription ID and a receiver for events
-    pub async fn subscribe(&self, kinds: Vec<EventKind>) -> Result<(SubscriptionId, Receiver<Event>)> {
+    /// This method blocks until all sync subscribers have acknowledged the event.
+    /// Use this when you need to ensure state changes are fully propagated before continuing.
+    /// Async subscribers receive the event but don't block the publisher.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Create a mailbox and wait for Index to finish updating
+    /// event_bus.publish_sync(Event::MailboxCreated {
+    ///     username: "alice".to_string(),
+    ///     mailbox: "INBOX".to_string(),
+    /// }).await?;
+    /// // Now we can safely query the Index for the new mailbox
+    /// ```
+    pub async fn publish_sync(&self, event: Event) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(BusCommand::PublishSync { event, reply: tx })
+            .await
+            .map_err(|_| Error::Internal("Event bus stopped".to_string()))?;
+
+        rx.await
+            .map_err(|_| Error::Internal("Event bus dropped reply".to_string()))?
+    }
+
+    /// Subscribe to specific event kinds with async delivery (fire and forget)
+    ///
+    /// Returns a subscription ID and a receiver for events.
+    /// Events are delivered without waiting for acknowledgment.
+    pub async fn subscribe(&self, kinds: Vec<EventKind>) -> Result<(SubscriptionId, Receiver<EventDelivery>)> {
+        self.subscribe_with_type(kinds, SubscriptionType::Async).await
+    }
+
+    /// Subscribe to specific event kinds with sync delivery
+    ///
+    /// Returns a subscription ID and a receiver for events.
+    /// When events are published via `publish_sync()`, the publisher waits for
+    /// this subscriber to acknowledge processing by calling `EventDelivery::acknowledge()`.
+    pub async fn subscribe_sync(&self, kinds: Vec<EventKind>) -> Result<(SubscriptionId, Receiver<EventDelivery>)> {
+        self.subscribe_with_type(kinds, SubscriptionType::Sync).await
+    }
+
+    /// Subscribe to specific event kinds with a specific subscription type
+    async fn subscribe_with_type(
+        &self,
+        kinds: Vec<EventKind>,
+        subscription_type: SubscriptionType,
+    ) -> Result<(SubscriptionId, Receiver<EventDelivery>)> {
         let (event_tx, event_rx) = bounded(100);
         let (reply_tx, reply_rx) = oneshot::channel();
 
         self.command_tx
             .send(BusCommand::Subscribe {
                 kinds,
+                subscription_type,
                 subscriber: event_tx,
                 reply: reply_tx,
             })
@@ -216,20 +409,29 @@ async fn event_bus_loop(command_rx: Receiver<BusCommand>) {
     while let Ok(cmd) = command_rx.recv().await {
         match cmd {
             BusCommand::Publish { event, reply } => {
-                let result = handle_publish(&event, &subscribers).await;
+                let result = handle_publish_async(&event, &subscribers).await;
+                let _ = reply.send(result);
+            }
+            BusCommand::PublishSync { event, reply } => {
+                let result = handle_publish_sync(&event, &subscribers).await;
                 let _ = reply.send(result);
             }
             BusCommand::Subscribe {
                 kinds,
+                subscription_type,
                 subscriber,
                 reply,
             } => {
                 let id = SubscriptionId::new();
                 subscribers.insert(id, Subscriber {
-                    kinds,
+                    kinds: kinds.clone(),
+                    subscription_type,
                     sender: subscriber,
                 });
-                debug!("New subscription: {:?} for {:?}", id, subscribers.get(&id).unwrap().kinds);
+                debug!(
+                    "New {:?} subscription: {:?} for {:?}",
+                    subscription_type, id, kinds
+                );
                 let _ = reply.send(Ok(id));
             }
             BusCommand::Unsubscribe { id, reply } => {
@@ -246,16 +448,20 @@ async fn event_bus_loop(command_rx: Receiver<BusCommand>) {
     }
 }
 
-/// Handle publishing an event to all interested subscribers
-async fn handle_publish(event: &Event, subscribers: &HashMap<SubscriptionId, Subscriber>) -> Result<()> {
+/// Handle publishing an event asynchronously (fire and forget)
+/// All subscribers receive the event wrapped in EventDelivery::Async
+async fn handle_publish_async(event: &Event, subscribers: &HashMap<SubscriptionId, Subscriber>) -> Result<()> {
     let event_kind = event.kind();
     let mut delivered = 0;
 
     for (id, subscriber) in subscribers {
         // Check if this subscriber is interested in this event kind
         if subscriber.kinds.contains(&event_kind) {
+            // Wrap event in async delivery
+            let delivery = EventDelivery::Async(event.clone());
+
             // Try to send the event
-            match subscriber.sender.try_send(event.clone()) {
+            match subscriber.sender.try_send(delivery) {
                 Ok(_) => {
                     delivered += 1;
                 }
@@ -266,7 +472,65 @@ async fn handle_publish(event: &Event, subscribers: &HashMap<SubscriptionId, Sub
         }
     }
 
-    debug!("Published {:?} to {} subscribers", event_kind, delivered);
+    debug!("Published {:?} (async) to {} subscribers", event_kind, delivered);
+    Ok(())
+}
+
+/// Handle publishing an event synchronously
+/// Sync subscribers get EventDelivery::Sync with an ack channel
+/// Async subscribers get EventDelivery::Async
+/// Waits for all sync subscribers to acknowledge before returning
+async fn handle_publish_sync(event: &Event, subscribers: &HashMap<SubscriptionId, Subscriber>) -> Result<()> {
+    let event_kind = event.kind();
+    let mut delivered = 0;
+    let mut ack_receivers = Vec::new();
+
+    for (id, subscriber) in subscribers {
+        // Check if this subscriber is interested in this event kind
+        if subscriber.kinds.contains(&event_kind) {
+            let delivery = match subscriber.subscription_type {
+                SubscriptionType::Async => {
+                    // Async subscribers get fire-and-forget delivery
+                    EventDelivery::Async(event.clone())
+                }
+                SubscriptionType::Sync => {
+                    // Sync subscribers get delivery with acknowledgment channel
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    ack_receivers.push(ack_rx);
+                    EventDelivery::Sync {
+                        event: event.clone(),
+                        ack: ack_tx,
+                    }
+                }
+            };
+
+            // Try to send the event
+            match subscriber.sender.try_send(delivery) {
+                Ok(_) => {
+                    delivered += 1;
+                }
+                Err(e) => {
+                    error!("Failed to deliver event to subscriber {:?}: {}", id, e);
+                }
+            }
+        }
+    }
+
+    // Wait for all sync subscribers to acknowledge
+    let sync_count = ack_receivers.len();
+    for ack_rx in ack_receivers {
+        // Wait for acknowledgment, but don't fail if the channel is dropped
+        // (subscriber might have been unsubscribed)
+        let _ = ack_rx.await;
+    }
+
+    debug!(
+        "Published {:?} (sync) to {} subscribers ({} sync, {} async)",
+        event_kind,
+        delivered,
+        sync_count,
+        delivered - sync_count
+    );
     Ok(())
 }
 
@@ -298,8 +562,8 @@ mod tests {
         bus.publish(event.clone()).await.unwrap();
 
         // Receive the event
-        let received = rx.recv().await.unwrap();
-        match received {
+        let delivery = rx.recv().await.unwrap();
+        match delivery.event() {
             Event::MailboxCreated { username, mailbox } => {
                 assert_eq!(username, "alice");
                 assert_eq!(mailbox, "INBOX");
@@ -343,8 +607,12 @@ mod tests {
         bus.publish(event).await.unwrap();
 
         // Both should receive it
-        let _ = rx1.recv().await.unwrap();
-        let _ = rx2.recv().await.unwrap();
+        let delivery1 = rx1.recv().await.unwrap();
+        let delivery2 = rx2.recv().await.unwrap();
+
+        // Verify both are async deliveries
+        assert!(matches!(delivery1, EventDelivery::Async(_)));
+        assert!(matches!(delivery2, EventDelivery::Async(_)));
 
         bus.shutdown().await.unwrap();
     }
@@ -384,14 +652,238 @@ mod tests {
         bus.publish(mailbox_event).await.unwrap();
 
         // Should only receive the mailbox event
-        let received = rx.recv().await.unwrap();
-        match received {
+        let delivery = rx.recv().await.unwrap();
+        match delivery.event() {
             Event::MailboxCreated { .. } => {} // Expected
             _ => panic!("Received wrong event type"),
         }
 
         // Channel should be empty now (no message event received)
         assert!(rx.try_recv().is_err());
+
+        bus.shutdown().await.unwrap();
+    }
+
+    #[async_std::test]
+    async fn test_sync_subscription() {
+        use async_std::task;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let bus = EventBus::new();
+        let verified = Arc::new(AtomicBool::new(false));
+        let verified_clone = verified.clone();
+
+        // Subscribe with sync delivery
+        let (_sub_id, mut rx) = bus
+            .subscribe_sync(vec![EventKind::MailboxCreated])
+            .await
+            .unwrap();
+
+        // Spawn a task to handle the event
+        task::spawn(async move {
+            let delivery = rx.recv().await.unwrap();
+
+            // Verify it's a sync delivery
+            match &delivery {
+                EventDelivery::Sync { event, .. } => {
+                    match event {
+                        Event::MailboxCreated { username, mailbox } => {
+                            assert_eq!(username, "alice");
+                            assert_eq!(mailbox, "INBOX");
+                            verified_clone.store(true, Ordering::SeqCst);
+                        }
+                        _ => panic!("Wrong event type received"),
+                    }
+                }
+                _ => panic!("Expected sync delivery"),
+            }
+
+            // Acknowledge the event
+            delivery.acknowledge();
+        });
+
+        // Publish a mailbox created event (waits for acknowledgment)
+        let event = Event::MailboxCreated {
+            username: "alice".to_string(),
+            mailbox: "INBOX".to_string(),
+        };
+        bus.publish_sync(event.clone()).await.unwrap();
+
+        // After publish_sync returns, the event should be verified
+        assert!(verified.load(Ordering::SeqCst));
+
+        bus.shutdown().await.unwrap();
+    }
+
+    #[async_std::test]
+    async fn test_publish_sync_waits_for_acknowledgment() {
+        use async_std::task;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let bus = EventBus::new();
+        let processed = Arc::new(AtomicBool::new(false));
+        let processed_clone = processed.clone();
+
+        // Subscribe with sync delivery
+        let (_sub_id, mut rx) = bus
+            .subscribe_sync(vec![EventKind::MailboxCreated])
+            .await
+            .unwrap();
+
+        // Spawn a task to handle the event with a delay
+        task::spawn(async move {
+            let delivery = rx.recv().await.unwrap();
+            // Simulate some processing time
+            task::sleep(Duration::from_millis(100)).await;
+            processed_clone.store(true, Ordering::SeqCst);
+            delivery.acknowledge();
+        });
+
+        // Publish sync - should wait for acknowledgment
+        let event = Event::MailboxCreated {
+            username: "alice".to_string(),
+            mailbox: "INBOX".to_string(),
+        };
+        bus.publish_sync(event).await.unwrap();
+
+        // After publish_sync returns, the event should be processed
+        assert!(processed.load(Ordering::SeqCst));
+
+        bus.shutdown().await.unwrap();
+    }
+
+    #[async_std::test]
+    async fn test_mixed_sync_and_async_subscribers() {
+        use async_std::task;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let bus = EventBus::new();
+        let sync_count = Arc::new(AtomicU32::new(0));
+        let async_count = Arc::new(AtomicU32::new(0));
+
+        // Sync subscriber
+        let (_id1, mut rx1) = bus
+            .subscribe_sync(vec![EventKind::MailboxCreated])
+            .await
+            .unwrap();
+        let sync_count_clone = sync_count.clone();
+        task::spawn(async move {
+            while let Ok(delivery) = rx1.recv().await {
+                sync_count_clone.fetch_add(1, Ordering::SeqCst);
+                delivery.acknowledge();
+            }
+        });
+
+        // Async subscriber
+        let (_id2, mut rx2) = bus
+            .subscribe(vec![EventKind::MailboxCreated])
+            .await
+            .unwrap();
+        let async_count_clone = async_count.clone();
+        task::spawn(async move {
+            while let Ok(delivery) = rx2.recv().await {
+                async_count_clone.fetch_add(1, Ordering::SeqCst);
+                delivery.acknowledge(); // No-op for async
+            }
+        });
+
+        // Publish sync
+        let event = Event::MailboxCreated {
+            username: "alice".to_string(),
+            mailbox: "INBOX".to_string(),
+        };
+        bus.publish_sync(event).await.unwrap();
+
+        // Give async subscriber time to receive
+        task::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Both should have received the event
+        assert_eq!(sync_count.load(Ordering::SeqCst), 1);
+        assert_eq!(async_count.load(Ordering::SeqCst), 1);
+
+        bus.shutdown().await.unwrap();
+    }
+
+    #[async_std::test]
+    async fn test_async_publish_does_not_wait() {
+        use async_std::task;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let bus = EventBus::new();
+        let processed = Arc::new(AtomicBool::new(false));
+        let processed_clone = processed.clone();
+
+        // Subscribe with sync delivery
+        let (_sub_id, mut rx) = bus
+            .subscribe_sync(vec![EventKind::MailboxCreated])
+            .await
+            .unwrap();
+
+        // Spawn a task to handle the event with a delay
+        task::spawn(async move {
+            let delivery = rx.recv().await.unwrap();
+            // Simulate some processing time
+            task::sleep(Duration::from_millis(100)).await;
+            processed_clone.store(true, Ordering::SeqCst);
+            delivery.acknowledge();
+        });
+
+        // Publish async - should NOT wait for acknowledgment
+        let event = Event::MailboxCreated {
+            username: "alice".to_string(),
+            mailbox: "INBOX".to_string(),
+        };
+        bus.publish(event).await.unwrap();
+
+        // After async publish returns, the event should NOT be processed yet
+        assert!(!processed.load(Ordering::SeqCst));
+
+        // Wait for processing to complete
+        task::sleep(Duration::from_millis(150)).await;
+        assert!(processed.load(Ordering::SeqCst));
+
+        bus.shutdown().await.unwrap();
+    }
+
+    #[async_std::test]
+    async fn test_multiple_sync_subscribers_all_acknowledged() {
+        use async_std::task;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let bus = EventBus::new();
+        let count = Arc::new(AtomicU32::new(0));
+
+        // Create 3 sync subscribers
+        for _ in 0..3 {
+            let (_id, mut rx) = bus
+                .subscribe_sync(vec![EventKind::MailboxCreated])
+                .await
+                .unwrap();
+            let count_clone = count.clone();
+            task::spawn(async move {
+                while let Ok(delivery) = rx.recv().await {
+                    count_clone.fetch_add(1, Ordering::SeqCst);
+                    delivery.acknowledge();
+                }
+            });
+        }
+
+        // Publish sync
+        let event = Event::MailboxCreated {
+            username: "alice".to_string(),
+            mailbox: "INBOX".to_string(),
+        };
+        bus.publish_sync(event).await.unwrap();
+
+        // All 3 subscribers should have processed and acknowledged
+        assert_eq!(count.load(Ordering::SeqCst), 3);
 
         bus.shutdown().await.unwrap();
     }
