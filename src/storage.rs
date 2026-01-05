@@ -14,12 +14,15 @@
 //! # Usage
 //!
 //! ```ignore
-//! use scuttled::storage::{Storage, FilesystemStore};
+//! use scuttled::storage::{Storage, FilesystemStore, run_storage_writer_loop};
 //! use scuttled::mailstore::format::MaildirFormat;
 //!
 //! let store = FilesystemStore::new("./data/mail").await?;
 //! let format = MaildirFormat;
-//! let storage = Storage::new(store, format).await?;
+//! let (storage, writer_rx) = Storage::new(store.clone(), format);
+//!
+//! // Server orchestrates the writer loop:
+//! task::spawn(run_storage_writer_loop(writer_rx, store));
 //!
 //! // Cheap to clone!
 //! let storage_clone = storage.clone();
@@ -47,7 +50,7 @@ pub use filesystem_store::FilesystemStore;
 
 /// Storage commands for the writer loop
 #[derive(Debug)]
-enum StorageCommand {
+pub enum StorageCommand {
     Write {
         path: String,
         content: Vec<u8>,
@@ -95,25 +98,35 @@ where
 
 impl<S, F> Storage<S, F>
 where
-    S: StoreMail + 'static,
-    F: MailboxFormat + Clone + Send + Sync + 'static,
+    S: StoreMail,
+    F: MailboxFormat + Clone,
 {
     /// Create a new Storage instance
     ///
-    /// This spawns a writer loop task and returns a handle that can be cloned cheaply.
-    pub async fn new(store: S, format: F) -> Result<Self> {
+    /// Returns a Storage handle and a receiver for the writer loop.
+    /// The caller must run the writer loop (via `run_writer_loop`) to process commands.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let store = FilesystemStore::new("./data").await?;
+    /// let format = MaildirFormat;
+    /// let (storage, writer_rx) = Storage::new(store.clone(), format);
+    ///
+    /// // Server orchestrates the writer loop:
+    /// let writer_future = run_storage_writer_loop(writer_rx, store);
+    /// ```
+    pub fn new(store: S, format: F) -> (Self, Receiver<StorageCommand>) {
         let (command_tx, command_rx) = bounded(100);
 
-        // Spawn writer loop for write coordination
-        let store_clone = store.clone();
-        task::spawn(storage_writer_loop(command_rx, store_clone));
-
-        Ok(Self {
-            store: store.clone(),
+        let storage = Self {
+            store,
             format,
             command_tx,
-        })
+        };
+
+        (storage, command_rx)
     }
+
 
     /// Store a message at the given path (write-once via channel)
     pub async fn store(&self, path: &str, content: &[u8]) -> Result<()> {
@@ -242,11 +255,15 @@ where
     }
 }
 
-/// Writer loop for coordinating write operations
+/// Run the writer loop for coordinating write operations
 ///
-/// All write operations (store, move, remove) go through this loop
-/// to ensure ordering and atomicity.
-async fn storage_writer_loop<S: StoreMail>(rx: Receiver<StorageCommand>, store: S) {
+/// This future should be run by the server alongside other tasks.
+/// All write operations go through this loop for ordering and atomicity.
+///
+/// # Arguments
+/// * `rx` - Command receiver from `Storage::new()`
+/// * `store` - StoreMail implementation to execute commands
+pub async fn run_storage_writer_loop<S: StoreMail>(rx: Receiver<StorageCommand>, store: S) {
     while let Ok(cmd) = rx.recv().await {
         match cmd {
             StorageCommand::Write { path, content, reply } => {
@@ -317,7 +334,11 @@ mod tests {
     async fn test_storage_creation() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
-        let storage = Storage::new(store, TestFormat).await.unwrap();
+        let (storage, writer_rx) = Storage::new(store.clone(), TestFormat);
+
+        // Spawn writer loop
+        task::spawn(run_storage_writer_loop(writer_rx, store));
+
         storage.shutdown().await.unwrap();
     }
 
@@ -325,7 +346,10 @@ mod tests {
     async fn test_storage_store_retrieve() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
-        let storage = Storage::new(store, TestFormat).await.unwrap();
+        let (storage, writer_rx) = Storage::new(store.clone(), TestFormat);
+
+        // Spawn writer loop
+        task::spawn(run_storage_writer_loop(writer_rx, store));
 
         let content = b"Hello, World!";
         storage.store("test/msg.eml", content).await.unwrap();
@@ -340,7 +364,10 @@ mod tests {
     async fn test_storage_delete() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
-        let storage = Storage::new(store, TestFormat).await.unwrap();
+        let (storage, writer_rx) = Storage::new(store.clone(), TestFormat);
+
+        // Spawn writer loop
+        task::spawn(run_storage_writer_loop(writer_rx, store));
 
         storage.store("test/msg.eml", b"content").await.unwrap();
         assert!(storage.exists("test/msg.eml").await.unwrap());
@@ -355,7 +382,10 @@ mod tests {
     async fn test_storage_update_flags() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
-        let storage = Storage::new(store, TestFormat).await.unwrap();
+        let (storage, writer_rx) = Storage::new(store.clone(), TestFormat);
+
+        // Spawn writer loop
+        task::spawn(run_storage_writer_loop(writer_rx, store));
 
         // Store message in new/
         storage
@@ -385,8 +415,11 @@ mod tests {
     async fn test_storage_clone() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
-        let storage1 = Storage::new(store, TestFormat).await.unwrap();
+        let (storage1, writer_rx) = Storage::new(store.clone(), TestFormat);
         let storage2 = storage1.clone(); // Cheap clone!
+
+        // Spawn writer loop
+        task::spawn(run_storage_writer_loop(writer_rx, store));
 
         storage1.store("test1.eml", b"from storage1").await.unwrap();
         storage2.store("test2.eml", b"from storage2").await.unwrap();
