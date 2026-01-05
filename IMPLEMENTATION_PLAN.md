@@ -202,35 +202,57 @@ struct Storage {
 
 ---
 
-### 1.4 CommandHandlers Registry (2-3 days)
+### 1.4 CommandHandlers Registry (2-3 days) 🚧 **IN PROGRESS**
 
 **Goal:** Create centralized command handler registry for extensibility.
 
+**Progress:** Registry and 8 core handlers complete. Remaining: Session/Server integration.
+
 **Tasks:**
-- [ ] Create CommandHandlers struct with HashMap<&str, Arc<dyn CommandHandler>>
-- [ ] Implement registration API: `register_handler(name, handler)`
+- [x] Create CommandHandlers struct with HashMap<String, Arc<dyn CommandHandler>>
+- [x] Implement registration API: `register()`, `get()`, `handle()`, `list_commands()`
+- [x] Add authentication and mailbox selection checking
+- [x] Implement built-in handlers as separate modules:
+  - [x] CapabilityHandler - Returns server capabilities
+  - [x] NoopHandler - Keepalive command
+  - [x] LogoutHandler - Graceful disconnect
+  - [x] LoginHandler - Username/password authentication
+  - [x] SelectHandler - Select mailbox for access
+  - [x] CreateHandler - Create new mailbox
+  - [x] DeleteHandler - Delete mailbox (protects INBOX)
+  - [x] ListHandler - List mailboxes with pattern matching
 - [ ] Move command dispatch logic from Session to CommandHandlers
-- [ ] Update Session to borrow TcpStream and hand to handlers
-- [ ] Implement built-in handlers as separate modules:
-  - LoginHandler
-  - SelectHandler
-  - FetchHandler
-  - SearchHandler
-  - StoreHandler
-  - etc.
+- [ ] Update Session to use CommandHandlers registry
+- [ ] Update Server to initialize CommandHandlers and register handlers
 
 **Files:**
-- `src/command_handlers.rs` (new file) - Registry
-- `src/handlers/` (new directory)
-  - `mod.rs` - Export all handlers
-  - `login.rs`, `select.rs`, `fetch.rs`, etc.
-- `src/session.rs` - Delegate to CommandHandlers
-- `src/server.rs` - Initialize CommandHandlers
+- `src/command_handlers.rs` ✅ Registry with 5 tests
+- `src/handlers/` ✅ 8 handlers implemented
+  - `mod.rs` ✅ Export all handlers
+  - `capability.rs` ✅ (61 lines)
+  - `noop.rs` ✅ (58 lines)
+  - `logout.rs` ✅ (58 lines)
+  - `login.rs` ✅ (123 lines)
+  - `select.rs` ✅ (100 lines)
+  - `create.rs` ✅ (82 lines)
+  - `delete.rs` ✅ (91 lines)
+  - `list.rs` ✅ (131 lines)
+- `src/session.rs` - Needs update to use CommandHandlers
+- `src/server.rs` - Needs handler registration
+
+**Completion Notes:**
+- CommandHandlers registry with HashMap-based dispatch
+- Authentication checking: requires_auth() enforced at registry level
+- Mailbox selection checking: requires_selected_mailbox() enforced
+- Each handler is self-contained with comprehensive tests
+- All 91 tests passing (up from 81)
+- Commits: 34715ef, 530ae71, 2302dbe
 
 **Success Criteria:**
-- Session no longer has command-specific logic
-- Adding new commands only requires implementing CommandHandler
-- Handlers borrow TcpStream for request/response lifecycle
+- ✅ CommandHandlers infrastructure complete
+- ✅ Core handlers implemented and tested
+- ⏳ Session delegation (remaining)
+- ⏳ Server initialization (remaining)
 
 ---
 
