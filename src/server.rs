@@ -4,13 +4,14 @@ use async_std::net::TcpListener;
 use async_std::prelude::*;
 use async_std::sync::Arc;
 use async_native_tls::TlsAcceptor;
-use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::error::Result;
 use crate::connection::Connection;
-use crate::{Authenticator, Index, MailStore, Queue, UserStore, CommandHandler, Mailboxes};
+use crate::{Authenticator, Index, MailStore, Queue, UserStore, Mailboxes};
+use crate::command_handlers::CommandHandlers;
 use crate::session::Session;
+use crate::handlers::*;
 
 const DEFAULT_MAX_SESSION_DURATION: Duration = Duration::from_secs(3600); // 1 hour
 const DEFAULT_MAX_IDLE_DURATION: Duration = Duration::from_secs(1800); // 30 minutes
@@ -24,7 +25,7 @@ pub struct ImapServer {
     user_store: Arc<dyn UserStore>,
     queue: Arc<dyn Queue>,
     mailboxes: Arc<dyn Mailboxes>,
-    custom_handlers: Arc<HashMap<String, Arc<dyn CommandHandler>>>,
+    command_handlers: Arc<CommandHandlers>,
     max_session_duration: Duration,
     max_idle_duration: Duration,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
@@ -49,6 +50,21 @@ impl ImapServer {
         Q: Queue + 'static,
         MB: Mailboxes + 'static,
     {
+        // Initialize command handlers with built-in handlers
+        let mut handlers = CommandHandlers::new();
+
+        // Register all built-in IMAP command handlers
+        // Note: CapabilityHandler always advertises STARTTLS - the command
+        // will fail gracefully if connection is already TLS
+        let _ = handlers.register(Arc::new(CapabilityHandler::new(false)));
+        let _ = handlers.register(Arc::new(NoopHandler::new()));
+        let _ = handlers.register(Arc::new(LogoutHandler::new()));
+        let _ = handlers.register(Arc::new(LoginHandler::new()));
+        let _ = handlers.register(Arc::new(SelectHandler::new()));
+        let _ = handlers.register(Arc::new(CreateHandler::new()));
+        let _ = handlers.register(Arc::new(DeleteHandler::new()));
+        let _ = handlers.register(Arc::new(ListHandler::new()));
+
         Self {
             mail_store: Arc::new(mail_store),
             index: Arc::new(index),
@@ -56,7 +72,7 @@ impl ImapServer {
             user_store,
             queue: Arc::new(queue),
             mailboxes: Arc::new(mailboxes),
-            custom_handlers: Arc::new(HashMap::new()),
+            command_handlers: Arc::new(handlers),
             max_session_duration: DEFAULT_MAX_SESSION_DURATION,
             max_idle_duration: DEFAULT_MAX_IDLE_DURATION,
             tls_acceptor: None,
@@ -105,13 +121,16 @@ impl ImapServer {
     /// Register a custom command handler
     ///
     /// This allows library users to extend the server with custom IMAP commands.
-    pub fn register_handler(&mut self, handler: Arc<dyn CommandHandler>) {
-        let handlers = Arc::make_mut(&mut self.custom_handlers);
-        handlers.insert(handler.command_name().to_uppercase(), handler);
+    pub fn register_handler(&mut self, handler: Arc<dyn crate::command_handler::CommandHandler>) -> Result<()> {
+        let handlers = Arc::make_mut(&mut self.command_handlers);
+        handlers.register(handler)
     }
 
     /// Create a new session for a client connection
     pub fn new_session(&self) -> Session {
+        // Clone the Arc<CommandHandlers> to share the registry with the session
+        let handlers = (*self.command_handlers).clone();
+
         Session::new(
             Arc::clone(&self.mail_store),
             Arc::clone(&self.index),
@@ -119,7 +138,7 @@ impl ImapServer {
             Arc::clone(&self.user_store),
             Arc::clone(&self.queue),
             Arc::clone(&self.mailboxes),
-            Arc::clone(&self.custom_handlers),
+            handlers,
             self.max_session_duration,
             self.max_idle_duration,
         )
