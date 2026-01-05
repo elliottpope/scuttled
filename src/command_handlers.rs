@@ -17,6 +17,7 @@ use crate::session_context::SessionContext;
 /// Maintains a mapping from command names to their handlers.
 /// Handlers can be registered at startup for built-in commands
 /// or dynamically for custom extensions.
+#[derive(Clone)]
 pub struct CommandHandlers {
     handlers: HashMap<String, Arc<dyn CommandHandler>>,
 }

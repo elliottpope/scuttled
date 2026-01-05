@@ -202,11 +202,9 @@ struct Storage {
 
 ---
 
-### 1.4 CommandHandlers Registry (2-3 days) 🚧 **IN PROGRESS**
+### 1.4 CommandHandlers Registry (2-3 days) ✅ **COMPLETE**
 
 **Goal:** Create centralized command handler registry for extensibility.
-
-**Progress:** Registry and 8 core handlers complete. Remaining: Session/Server integration.
 
 **Tasks:**
 - [x] Create CommandHandlers struct with HashMap<String, Arc<dyn CommandHandler>>
@@ -221,12 +219,12 @@ struct Storage {
   - [x] CreateHandler - Create new mailbox
   - [x] DeleteHandler - Delete mailbox (protects INBOX)
   - [x] ListHandler - List mailboxes with pattern matching
-- [ ] Move command dispatch logic from Session to CommandHandlers
-- [ ] Update Session to use CommandHandlers registry
-- [ ] Update Server to initialize CommandHandlers and register handlers
+- [x] Move command dispatch logic from Session to CommandHandlers
+- [x] Update Session to use CommandHandlers registry
+- [x] Update Server to initialize CommandHandlers and register handlers
 
 **Files:**
-- `src/command_handlers.rs` ✅ Registry with 5 tests
+- `src/command_handlers.rs` ✅ Registry with Clone support and 5 tests
 - `src/handlers/` ✅ 8 handlers implemented
   - `mod.rs` ✅ Export all handlers
   - `capability.rs` ✅ (61 lines)
@@ -237,22 +235,28 @@ struct Storage {
   - `create.rs` ✅ (82 lines)
   - `delete.rs` ✅ (91 lines)
   - `list.rs` ✅ (131 lines)
-- `src/session.rs` - Needs update to use CommandHandlers
-- `src/server.rs` - Needs handler registration
+- `src/session.rs` ✅ Fully refactored to use CommandHandlers
+- `src/server.rs` ✅ Initializes and registers all handlers
 
 **Completion Notes:**
 - CommandHandlers registry with HashMap-based dispatch
+- Made CommandHandlers Clone for easy sharing between sessions
 - Authentication checking: requires_auth() enforced at registry level
 - Mailbox selection checking: requires_selected_mailbox() enforced
 - Each handler is self-contained with comprehensive tests
-- All 91 tests passing (up from 81)
-- Commits: 34715ef, 530ae71, 2302dbe
+- Session refactored to delegate all commands to CommandHandlers registry
+  - Created `create_session_context()` helper to build SessionContext from Session state
+  - Created `sync_from_context()` helper to sync SessionContext state back to Session
+  - Removed all old handler methods (handle_capability, handle_login, etc.)
+- Server initializes all 8 built-in handlers at startup
+- All 91 tests passing
+- Commits: 34715ef, 530ae71, 2302dbe, 2bc4c36
 
 **Success Criteria:**
 - ✅ CommandHandlers infrastructure complete
 - ✅ Core handlers implemented and tested
-- ⏳ Session delegation (remaining)
-- ⏳ Server initialization (remaining)
+- ✅ Session delegation complete
+- ✅ Server initialization complete
 
 ---
 
