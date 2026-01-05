@@ -26,7 +26,7 @@ pub mod session;
 pub use error::{Error, Result};
 pub use types::*;
 pub use mailstore::MailStore;
-pub use storage::{Storage, StoreMail, FilesystemStore};
+pub use storage::{Storage, StoreMail, FilesystemStore, run_storage_writer_loop};
 pub use mailbox::{Mailbox, MailboxState, MailboxNotification};
 pub use index::Index;
 pub use searcher::Searcher;
