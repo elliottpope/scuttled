@@ -1,17 +1,18 @@
 //! IMAP server implementation
 
+use async_native_tls::TlsAcceptor;
 use async_std::net::TcpListener;
 use async_std::prelude::*;
 use async_std::sync::Arc;
-use async_native_tls::TlsAcceptor;
 use std::time::Duration;
 
-use crate::error::Result;
-use crate::connection::Connection;
-use crate::{Authenticator, Index, MailStore, Queue, UserStore, Mailboxes};
 use crate::command_handlers::CommandHandlers;
-use crate::session::Session;
+use crate::connection::Connection;
+use crate::error::Result;
 use crate::handlers::*;
+use crate::index::Indexer;
+use crate::session::Session;
+use crate::{Authenticator, Index, MailStore, Mailboxes, Queue, UserStore};
 
 const DEFAULT_MAX_SESSION_DURATION: Duration = Duration::from_secs(3600); // 1 hour
 const DEFAULT_MAX_IDLE_DURATION: Duration = Duration::from_secs(1800); // 30 minutes
@@ -20,7 +21,7 @@ const DEFAULT_MAX_IDLE_DURATION: Duration = Duration::from_secs(1800); // 30 min
 #[derive(Clone)]
 pub struct ImapServer {
     mail_store: Arc<dyn MailStore>,
-    index: Arc<dyn Index>,
+    index: Indexer,
     authenticator: Arc<dyn Authenticator>,
     user_store: Arc<dyn UserStore>,
     queue: Arc<dyn Queue>,
@@ -34,17 +35,16 @@ pub struct ImapServer {
 impl ImapServer {
     /// Create a new IMAP server with the given stores
     #[allow(clippy::too_many_arguments)]
-    pub fn new<M, I, A, U, Q, MB>(
+    pub fn new<M, A, U, Q, MB>(
         mail_store: M,
-        index: I,
+        index: Indexer,
         authenticator: A,
         user_store: Arc<U>,
         queue: Q,
-        mailboxes: MB,
+        mailboxes: Arc<MB>,
     ) -> Self
     where
         M: MailStore + 'static,
-        I: Index + 'static,
         A: Authenticator + 'static,
         U: UserStore + 'static,
         Q: Queue + 'static,
@@ -67,11 +67,11 @@ impl ImapServer {
 
         Self {
             mail_store: Arc::new(mail_store),
-            index: Arc::new(index),
+            index,
             authenticator: Arc::new(authenticator),
             user_store,
             queue: Arc::new(queue),
-            mailboxes: Arc::new(mailboxes),
+            mailboxes,
             command_handlers: Arc::new(handlers),
             max_session_duration: DEFAULT_MAX_SESSION_DURATION,
             max_idle_duration: DEFAULT_MAX_IDLE_DURATION,
@@ -100,8 +100,9 @@ impl ImapServer {
     ///
     /// * `identity` - A native_tls::Identity containing the certificate and private key
     pub fn with_tls_identity(mut self, identity: native_tls::Identity) -> Result<Self> {
-        let acceptor = native_tls::TlsAcceptor::new(identity)
-            .map_err(|e| crate::error::Error::TlsError(format!("Failed to create TLS acceptor: {}", e)))?;
+        let acceptor = native_tls::TlsAcceptor::new(identity).map_err(|e| {
+            crate::error::Error::TlsError(format!("Failed to create TLS acceptor: {}", e))
+        })?;
         self.tls_acceptor = Some(Arc::new(TlsAcceptor::from(acceptor)));
         Ok(self)
     }
@@ -113,15 +114,19 @@ impl ImapServer {
     /// * `cert_pem` - PEM-encoded certificate
     /// * `key_pem` - PEM-encoded private key
     pub fn with_tls_pem(self, cert_pem: &[u8], key_pem: &[u8]) -> Result<Self> {
-        let identity = native_tls::Identity::from_pkcs8(cert_pem, key_pem)
-            .map_err(|e| crate::error::Error::TlsError(format!("Failed to create identity from PEM: {}", e)))?;
+        let identity = native_tls::Identity::from_pkcs8(cert_pem, key_pem).map_err(|e| {
+            crate::error::Error::TlsError(format!("Failed to create identity from PEM: {}", e))
+        })?;
         self.with_tls_identity(identity)
     }
 
     /// Register a custom command handler
     ///
     /// This allows library users to extend the server with custom IMAP commands.
-    pub fn register_handler(&mut self, handler: Arc<dyn crate::command_handler::CommandHandler>) -> Result<()> {
+    pub fn register_handler(
+        &mut self,
+        handler: Arc<dyn crate::command_handler::CommandHandler>,
+    ) -> Result<()> {
         let handlers = Arc::make_mut(&mut self.command_handlers);
         handlers.register(handler)
     }
@@ -133,7 +138,7 @@ impl ImapServer {
 
         Session::new(
             Arc::clone(&self.mail_store),
-            Arc::clone(&self.index),
+            self.index.clone(),
             Arc::clone(&self.authenticator),
             Arc::clone(&self.user_store),
             Arc::clone(&self.queue),
@@ -180,8 +185,11 @@ impl ImapServer {
     ///
     /// Returns an error if TLS is not configured via `with_tls_identity()` or `with_tls_pem()`
     pub async fn listen_tls(&self, addr: &str) -> Result<()> {
-        let acceptor = self.tls_acceptor.as_ref()
-            .ok_or_else(|| crate::error::Error::TlsError("TLS not configured. Call with_tls_identity() or with_tls_pem() first.".to_string()))?;
+        let acceptor = self.tls_acceptor.as_ref().ok_or_else(|| {
+            crate::error::Error::TlsError(
+                "TLS not configured. Call with_tls_identity() or with_tls_pem() first.".to_string(),
+            )
+        })?;
 
         let listener = TcpListener::bind(addr).await?;
         log::info!("IMAP server listening on {} (implicit TLS)", addr);
@@ -191,8 +199,9 @@ impl ImapServer {
             let stream = stream?;
 
             // Perform TLS handshake immediately
-            let tls_stream = acceptor.accept(stream).await
-                .map_err(|e| crate::error::Error::TlsError(format!("TLS handshake failed: {}", e)))?;
+            let tls_stream = acceptor.accept(stream).await.map_err(|e| {
+                crate::error::Error::TlsError(format!("TLS handshake failed: {}", e))
+            })?;
 
             let connection = Connection::tls(tls_stream);
 
@@ -217,16 +226,20 @@ impl ImapServer {
     ///
     /// Returns an error if TLS is not configured via `with_tls_identity()` or `with_tls_pem()`
     pub async fn listen_on_tls(&self, listener: TcpListener) -> Result<()> {
-        let acceptor = self.tls_acceptor.as_ref()
-            .ok_or_else(|| crate::error::Error::TlsError("TLS not configured. Call with_tls_identity() or with_tls_pem() first.".to_string()))?;
+        let acceptor = self.tls_acceptor.as_ref().ok_or_else(|| {
+            crate::error::Error::TlsError(
+                "TLS not configured. Call with_tls_identity() or with_tls_pem() first.".to_string(),
+            )
+        })?;
 
         let mut incoming = listener.incoming();
         while let Some(stream) = incoming.next().await {
             let stream = stream?;
 
             // Perform TLS handshake immediately
-            let tls_stream = acceptor.accept(stream).await
-                .map_err(|e| crate::error::Error::TlsError(format!("TLS handshake failed: {}", e)))?;
+            let tls_stream = acceptor.accept(stream).await.map_err(|e| {
+                crate::error::Error::TlsError(format!("TLS handshake failed: {}", e))
+            })?;
 
             let connection = Connection::tls(tls_stream);
 

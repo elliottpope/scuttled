@@ -21,7 +21,12 @@ use crate::types::*;
 
 /// Write commands for the indexer (only writes go through the channel)
 enum WriteCommand {
-    AddMessage(String, String, IndexedMessage, oneshot::Sender<Result<String>>),
+    AddMessage(
+        String,
+        String,
+        IndexedMessage,
+        oneshot::Sender<Result<String>>,
+    ),
     UpdateFlags(MessageId, Vec<MessageFlag>, oneshot::Sender<Result<()>>),
     DeleteMessage(MessageId, oneshot::Sender<Result<()>>),
     RemoveMessagesForMailbox(String, String, oneshot::Sender<Result<()>>),
@@ -36,6 +41,7 @@ enum WriteCommand {
 /// - EventBus integration (subscribes to filesystem events)
 /// - Unique ID tracking (maps filesystem paths to MessageIds)
 /// - UID assignment via Mailboxes (for global synchronization)
+#[derive(Clone)]
 pub struct Indexer {
     backend: Arc<RwLock<Box<dyn IndexBackend>>>,
     write_tx: Sender<WriteCommand>,
@@ -48,7 +54,10 @@ impl Indexer {
     ///
     /// Note: This is internal. Users should use backend-specific constructors
     /// like `create_inmemory_index()` instead.
-    pub(crate) fn new(backend: Box<dyn IndexBackend>, mailboxes: Option<Arc<dyn Mailboxes>>) -> Self {
+    pub(crate) fn new(
+        backend: Box<dyn IndexBackend>,
+        mailboxes: Option<Arc<dyn Mailboxes>>,
+    ) -> Self {
         Self::with_event_bus(backend, None, mailboxes)
     }
 
@@ -142,7 +151,9 @@ impl Indexer {
         uid: Uid,
     ) -> Result<Option<String>> {
         let backend = self.backend.read().await;
-        backend.get_message_path_by_uid(username, mailbox, uid).await
+        backend
+            .get_message_path_by_uid(username, mailbox, uid)
+            .await
     }
 
     /// List all message paths in a mailbox
@@ -200,10 +211,7 @@ impl Indexer {
 }
 
 /// Writer loop that processes write commands serially
-async fn writer_loop(
-    rx: Receiver<WriteCommand>,
-    backend: Arc<RwLock<Box<dyn IndexBackend>>>,
-) {
+async fn writer_loop(rx: Receiver<WriteCommand>, backend: Arc<RwLock<Box<dyn IndexBackend>>>) {
     while let Ok(cmd) = rx.recv().await {
         match cmd {
             WriteCommand::AddMessage(username, mailbox, message, reply) => {
@@ -223,7 +231,9 @@ async fn writer_loop(
             }
             WriteCommand::RemoveMessagesForMailbox(username, mailbox, reply) => {
                 let mut backend = backend.write().await;
-                let result = backend.remove_messages_for_mailbox(&username, &mailbox).await;
+                let result = backend
+                    .remove_messages_for_mailbox(&username, &mailbox)
+                    .await;
                 let _ = reply.send(result);
             }
             WriteCommand::Shutdown(reply) => {
@@ -332,7 +342,10 @@ async fn event_listener(
                         // Track the unique_id -> MessageId mapping
                         let mut mapping = unique_id_mapping.write().await;
                         mapping.insert(path, message_id);
-                        info!("Indexer added message: {}/{}/{}", username, mailbox, unique_id);
+                        info!(
+                            "Indexer added message: {}/{}/{}",
+                            username, mailbox, unique_id
+                        );
                     }
                     Ok(Err(e)) => {
                         error!(
@@ -465,13 +478,22 @@ async fn event_listener(
 
                 match rx.await {
                     Ok(Ok(())) => {
-                        info!("Indexer removed all messages for mailbox: {}/{}", username, mailbox);
+                        info!(
+                            "Indexer removed all messages for mailbox: {}/{}",
+                            username, mailbox
+                        );
                     }
                     Ok(Err(e)) => {
-                        error!("Failed to remove messages for mailbox {}/{}: {}", username, mailbox, e);
+                        error!(
+                            "Failed to remove messages for mailbox {}/{}: {}",
+                            username, mailbox, e
+                        );
                     }
                     Err(_) => {
-                        error!("Writer loop dropped remove_messages_for_mailbox reply for {}/{}", username, mailbox);
+                        error!(
+                            "Writer loop dropped remove_messages_for_mailbox reply for {}/{}",
+                            username, mailbox
+                        );
                     }
                 }
 

@@ -1,15 +1,21 @@
 //! Session context for command handlers
 
-use async_std::sync::{Arc, RwLock};
-use crate::{Authenticator, Index, MailStore, Queue, UserStore};
+use crate::index::Indexer;
 use crate::types::*;
+use crate::{Authenticator, MailStore, Mailboxes, Queue, UserStore};
+use async_std::sync::{Arc, RwLock};
 
 /// Session state
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionState {
     NotAuthenticated,
-    Authenticated { username: Username },
-    Selected { username: Username, mailbox: MailboxName },
+    Authenticated {
+        username: Username,
+    },
+    Selected {
+        username: Username,
+        mailbox: MailboxName,
+    },
     Logout,
 }
 
@@ -18,28 +24,30 @@ pub enum SessionState {
 /// Contains references to all server stores and the current session state
 pub struct SessionContext {
     pub mail_store: Arc<dyn MailStore>,
-    pub index: Arc<dyn Index>,
+    pub index: Indexer,
     pub authenticator: Arc<dyn Authenticator>,
     pub user_store: Arc<dyn UserStore>,
     pub queue: Arc<dyn Queue>,
+    pub mailboxes: Arc<dyn Mailboxes>,
     pub state: Arc<RwLock<SessionState>>,
     pub selected_mailbox: Arc<RwLock<Option<MailboxName>>>,
 }
 
 impl SessionContext {
-    pub fn new<M, I, A, U, Q>(
+    pub fn new<M, A, U, Q, B>(
         mail_store: Arc<M>,
-        index: Arc<I>,
+        index: Indexer,
         authenticator: Arc<A>,
         user_store: Arc<U>,
         queue: Arc<Q>,
+        mailboxes: Arc<B>,
     ) -> Self
     where
         M: MailStore + 'static,
-        I: Index + 'static,
         A: Authenticator + 'static,
         U: UserStore + 'static,
         Q: Queue + 'static,
+        B: Mailboxes + 'static,
     {
         Self {
             mail_store,
@@ -47,6 +55,7 @@ impl SessionContext {
             authenticator,
             user_store,
             queue,
+            mailboxes,
             state: Arc::new(RwLock::new(SessionState::NotAuthenticated)),
             selected_mailbox: Arc::new(RwLock::new(None)),
         }

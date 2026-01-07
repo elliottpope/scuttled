@@ -4,7 +4,7 @@ use async_std::fs;
 use async_std::task::spawn;
 use futures::prelude::*;
 use scuttled::authenticator::r#impl::BasicAuthenticator;
-use scuttled::index::r#impl::InMemoryIndex;
+use scuttled::index::r#impl::{create_inmemory_index, InMemoryIndex};
 use scuttled::mailboxes::r#impl::InMemoryMailboxes;
 use scuttled::mailstore::r#impl::FilesystemMailStore;
 use scuttled::queue::r#impl::ChannelQueue;
@@ -30,9 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Initializing IMAP server components...");
 
     let mail_store = FilesystemMailStore::new(&mail_dir).await?;
-    let index = InMemoryIndex::new();
     let user_store = Arc::new(SQLiteUserStore::new(&db_path).await?);
-    let mailboxes = InMemoryMailboxes::new();
+    let mailboxes = Arc::new(InMemoryMailboxes::new());
+    let index = create_inmemory_index(Some(mailboxes.clone()));
 
     log::info!("Creating default test user...");
     if let Err(e) = user_store.create_user("test", "test").await {
@@ -40,9 +40,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log::info!("Creating default INBOX...");
-    if let Err(e) = index.create_mailbox("test", "INBOX").await {
-        log::warn!("Failed to create INBOX (may already exist): {}", e);
-    }
     if let Err(e) = mailboxes.create_mailbox("test", "INBOX").await {
         log::warn!("Failed to create INBOX (may already exist): {}", e);
     }

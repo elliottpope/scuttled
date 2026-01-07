@@ -9,13 +9,13 @@
 //! - `Indexer`: Public coordinating wrapper that adds EventBus integration and write ordering
 //! - Backend implementations are hidden; users interact only with `Indexer`
 
-use async_trait::async_trait;
 use crate::error::Result;
 use crate::types::*;
+use async_trait::async_trait;
 
 pub(crate) mod backend;
-mod indexer;
 pub mod r#impl;
+pub mod indexer;
 
 // Re-export public types
 pub use indexer::Indexer;
@@ -43,13 +43,23 @@ pub trait Index: Send + Sync {
     async fn get_mailbox(&self, username: &str, name: &str) -> Result<Option<Mailbox>>;
 
     /// Add a message to the index
-    async fn add_message(&self, username: &str, mailbox: &str, message: IndexedMessage) -> Result<String>;
+    async fn add_message(
+        &self,
+        username: &str,
+        mailbox: &str,
+        message: IndexedMessage,
+    ) -> Result<String>;
 
     /// Get a message by its ID (returns the file path)
     async fn get_message_path(&self, id: MessageId) -> Result<Option<String>>;
 
     /// Get a message by mailbox and UID (returns the file path)
-    async fn get_message_path_by_uid(&self, username: &str, mailbox: &str, uid: Uid) -> Result<Option<String>>;
+    async fn get_message_path_by_uid(
+        &self,
+        username: &str,
+        mailbox: &str,
+        uid: Uid,
+    ) -> Result<Option<String>>;
 
     /// List all message paths in a mailbox
     async fn list_message_paths(&self, username: &str, mailbox: &str) -> Result<Vec<String>>;
@@ -64,7 +74,12 @@ pub trait Index: Send + Sync {
     async fn delete_message(&self, id: MessageId) -> Result<()>;
 
     /// Search for messages matching a query (returns file paths)
-    async fn search(&self, username: &str, mailbox: &str, query: &SearchQuery) -> Result<Vec<String>>;
+    async fn search(
+        &self,
+        username: &str,
+        mailbox: &str,
+        query: &SearchQuery,
+    ) -> Result<Vec<String>>;
 
     /// Get the next available UID for a mailbox
     async fn get_next_uid(&self, username: &str, mailbox: &str) -> Result<Uid>;
