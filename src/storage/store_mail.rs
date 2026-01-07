@@ -3,8 +3,8 @@
 //! Implementations should be simple, direct file I/O without channels.
 //! The Storage layer coordinates channel-based writes.
 
-use async_trait::async_trait;
 use crate::error::Result;
+use async_trait::async_trait;
 
 /// Trait for basic file operations on email storage
 ///
@@ -13,7 +13,7 @@ use crate::error::Result;
 ///
 /// The Storage layer handles write coordination via channels.
 #[async_trait]
-pub trait StoreMail: Send + Sync + Clone {
+pub trait StoreMail: Clone {
     /// Write content to a file at the given path
     ///
     /// Creates parent directories if needed.

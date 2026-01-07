@@ -1,10 +1,10 @@
 //! SELECT command handler
 
-use async_trait::async_trait;
 use crate::command_handler::CommandHandler;
 use crate::error::Result;
 use crate::protocol::Response;
 use crate::session_context::{SessionContext, SessionState};
+use async_trait::async_trait;
 
 /// Handler for the SELECT command
 ///
@@ -58,7 +58,7 @@ impl CommandHandler for SelectHandler {
 
         // Check if mailbox exists
         let mailbox = context
-            .index
+            .mailboxes
             .get_mailbox(&username, mailbox_name)
             .await?;
 
@@ -78,7 +78,9 @@ impl CommandHandler for SelectHandler {
             .await;
 
         // Store selected mailbox in context
-        context.set_selected_mailbox(Some(mailbox_name.to_string())).await;
+        context
+            .set_selected_mailbox(Some(mailbox_name.to_string()))
+            .await;
 
         Ok(Response::Ok {
             tag: Some(tag.to_string()),

@@ -2,19 +2,20 @@
 //!
 //! This module contains session-related structures for managing IMAP client connections.
 
-use std::collections::{HashSet, HashMap};
-use std::time::{Duration, Instant};
-use async_std::prelude::*;
-use async_std::io::BufReader;
-use async_std::sync::{Arc, RwLock};
 use async_native_tls::TlsAcceptor;
+use async_std::io::BufReader;
+use async_std::prelude::*;
+use async_std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
-use crate::error::{Error, Result};
 use crate::connection::Connection;
+use crate::error::{Error, Result};
+use crate::index::Indexer;
 use crate::protocol::{parse_command, Command, Response};
-use crate::types::*;
-use crate::{Authenticator, Index, MailStore, Queue, UserStore, CommandHandlers, Mailboxes};
 use crate::session_context::{SessionContext, SessionState};
+use crate::types::*;
+use crate::{Authenticator, CommandHandlers, Index, MailStore, Mailboxes, Queue, UserStore};
 
 const DEFAULT_MAX_TAG_HISTORY: usize = 10000;
 
@@ -44,7 +45,9 @@ impl TagHistory {
         }
 
         if self.tags.len() >= self.max_size {
-            return Err(Error::ProtocolError("Maximum tag history exceeded".to_string()));
+            return Err(Error::ProtocolError(
+                "Maximum tag history exceeded".to_string(),
+            ));
         }
 
         self.tags.insert(tag);
@@ -114,7 +117,7 @@ pub struct Session {
 
     // Server components
     mail_store: Arc<dyn MailStore>,
-    index: Arc<dyn Index>,
+    index: Indexer,
     authenticator: Arc<dyn Authenticator>,
     user_store: Arc<dyn UserStore>,
     queue: Arc<dyn Queue>,
@@ -127,7 +130,7 @@ impl Session {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mail_store: Arc<dyn MailStore>,
-        index: Arc<dyn Index>,
+        index: Indexer,
         authenticator: Arc<dyn Authenticator>,
         user_store: Arc<dyn UserStore>,
         queue: Arc<dyn Queue>,
@@ -157,7 +160,11 @@ impl Session {
     }
 
     /// Handle the session by processing commands from the connection
-    pub async fn handle(mut self, mut connection: Connection, tls_acceptor: Option<Arc<TlsAcceptor>>) -> Result<()> {
+    pub async fn handle(
+        mut self,
+        mut connection: Connection,
+        tls_acceptor: Option<Arc<TlsAcceptor>>,
+    ) -> Result<()> {
         let peer_addr = connection.peer_addr().ok();
 
         // Send greeting
@@ -182,16 +189,28 @@ impl Session {
 
                 // Check session timeouts
                 if self.session_started.elapsed() > self.max_session_duration {
-                    let _ = self.send_response(&connection, &Response::Bye {
-                        message: "Session duration exceeded".to_string(),
-                    }).await;
-                    return Err(Error::ProtocolError("Session duration exceeded".to_string()));
+                    let _ = self
+                        .send_response(
+                            &connection,
+                            &Response::Bye {
+                                message: "Session duration exceeded".to_string(),
+                            },
+                        )
+                        .await;
+                    return Err(Error::ProtocolError(
+                        "Session duration exceeded".to_string(),
+                    ));
                 }
 
                 if self.last_client_interaction.elapsed() > self.max_idle_duration {
-                    let _ = self.send_response(&connection, &Response::Bye {
-                        message: "Session idle timeout".to_string(),
-                    }).await;
+                    let _ = self
+                        .send_response(
+                            &connection,
+                            &Response::Bye {
+                                message: "Session idle timeout".to_string(),
+                            },
+                        )
+                        .await;
                     return Err(Error::ProtocolError("Session idle timeout".to_string()));
                 }
 
@@ -206,10 +225,15 @@ impl Session {
                 // Parse tag and command
                 let parts: Vec<&str> = line.splitn(2, ' ').collect();
                 if parts.len() < 2 {
-                    let _ = self.send_response(&connection, &Response::Bad {
-                        tag: None,
-                        message: "Invalid command format".to_string(),
-                    }).await;
+                    let _ = self
+                        .send_response(
+                            &connection,
+                            &Response::Bad {
+                                tag: None,
+                                message: "Invalid command format".to_string(),
+                            },
+                        )
+                        .await;
                     continue;
                 }
 
@@ -218,10 +242,15 @@ impl Session {
 
                 // Register tag
                 if let Err(e) = self.tag_history.register(tag.clone()) {
-                    let _ = self.send_response(&connection, &Response::Bad {
-                        tag: Some(tag),
-                        message: format!("Tag error: {}", e),
-                    }).await;
+                    let _ = self
+                        .send_response(
+                            &connection,
+                            &Response::Bad {
+                                tag: Some(tag),
+                                message: format!("Tag error: {}", e),
+                            },
+                        )
+                        .await;
                     continue;
                 }
 
@@ -229,10 +258,15 @@ impl Session {
                 let command = match parse_command(&tag, command_line) {
                     Ok(cmd) => cmd,
                     Err(e) => {
-                        let _ = self.send_response(&connection, &Response::Bad {
-                            tag: Some(tag),
-                            message: format!("Parse error: {}", e),
-                        }).await;
+                        let _ = self
+                            .send_response(
+                                &connection,
+                                &Response::Bad {
+                                    tag: Some(tag),
+                                    message: format!("Parse error: {}", e),
+                                },
+                            )
+                            .await;
                         continue;
                     }
                 };
@@ -267,7 +301,9 @@ impl Session {
                         drop(lines);
 
                         // Upgrade to TLS
-                        connection = connection.upgrade_to_tls(tls_acceptor.as_ref().unwrap()).await?;
+                        connection = connection
+                            .upgrade_to_tls(tls_acceptor.as_ref().unwrap())
+                            .await?;
                         log::info!("Connection upgraded to TLS for {:?}", peer_addr);
 
                         // Mark that we should continue with the upgraded connection
@@ -281,7 +317,9 @@ impl Session {
                 }
 
                 // Handle all other commands normally
-                let response = self.handle_command(&tag, command, connection.is_tls()).await;
+                let response = self
+                    .handle_command(&tag, command, connection.is_tls())
+                    .await;
                 if let Err(e) = self.send_response(&connection, &response).await {
                     eprintln!("Error sending response: {}", e);
                     return Ok(());
@@ -306,7 +344,9 @@ impl Session {
         // Determine current session state
         let state = if let Some(ref mailbox) = self.selected_mailbox {
             SessionState::Selected {
-                username: self.authenticated_user.as_ref()
+                username: self
+                    .authenticated_user
+                    .as_ref()
                     .map(|u| u.username.clone())
                     .unwrap_or_default(),
                 mailbox: mailbox.name.clone(),
@@ -321,13 +361,14 @@ impl Session {
 
         SessionContext {
             mail_store: Arc::clone(&self.mail_store),
-            index: Arc::clone(&self.index),
+            index: self.index.clone(),
             authenticator: Arc::clone(&self.authenticator),
             user_store: Arc::clone(&self.user_store),
             queue: Arc::clone(&self.queue),
+            mailboxes: Arc::clone(&self.mailboxes),
             state: Arc::new(RwLock::new(state)),
             selected_mailbox: Arc::new(RwLock::new(
-                self.selected_mailbox.as_ref().map(|m| m.name.clone())
+                self.selected_mailbox.as_ref().map(|m| m.name.clone()),
             )),
         }
     }
@@ -350,7 +391,10 @@ impl Session {
                 }
                 self.selected_mailbox = None;
             }
-            SessionState::Selected { ref username, ref mailbox } => {
+            SessionState::Selected {
+                ref username,
+                ref mailbox,
+            } => {
                 // Update authenticated user if changed
                 if self.authenticated_user.as_ref().map(|u| &u.username) != Some(username) {
                     if let Ok(Some(user)) = self.user_store.get_user(username).await {
@@ -402,9 +446,7 @@ impl Session {
             Command::Select { mailbox } => ("SELECT", mailbox),
             Command::Create { mailbox } => ("CREATE", mailbox),
             Command::Delete { mailbox } => ("DELETE", mailbox),
-            Command::List { reference, pattern } => {
-                ("LIST", format!("{} {}", reference, pattern))
-            }
+            Command::List { reference, pattern } => ("LIST", format!("{} {}", reference, pattern)),
             Command::Custom { name, args } => {
                 owned_name = name;
                 (owned_name.as_str(), args)
@@ -421,7 +463,10 @@ impl Session {
         let mut context = self.create_session_context().await;
 
         // Delegate to command handlers registry
-        let response = self.command_handlers.handle(command_name, tag, &args, &mut context).await;
+        let response = self
+            .command_handlers
+            .handle(command_name, tag, &args, &mut context)
+            .await;
 
         // Sync session state back from context
         self.sync_from_context(&context).await;

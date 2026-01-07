@@ -1,10 +1,10 @@
 //! DELETE command handler
 
-use async_trait::async_trait;
 use crate::command_handler::CommandHandler;
 use crate::error::Result;
 use crate::protocol::Response;
 use crate::session_context::{SessionContext, SessionState};
+use async_trait::async_trait;
 
 /// Handler for the DELETE command
 ///
@@ -65,7 +65,11 @@ impl CommandHandler for DeleteHandler {
         };
 
         // Try to delete the mailbox
-        match context.index.delete_mailbox(&username, mailbox_name).await {
+        match context
+            .mailboxes
+            .delete_mailbox(&username, mailbox_name)
+            .await
+        {
             Ok(_) => Ok(Response::Ok {
                 tag: Some(tag.to_string()),
                 message: format!("DELETE completed for {}", mailbox_name),

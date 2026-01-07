@@ -1,10 +1,10 @@
 //! LIST command handler
 
-use async_trait::async_trait;
 use crate::command_handler::CommandHandler;
 use crate::error::Result;
 use crate::protocol::Response;
 use crate::session_context::{SessionContext, SessionState};
+use async_trait::async_trait;
 
 /// Handler for the LIST command
 ///
@@ -71,7 +71,7 @@ impl CommandHandler for ListHandler {
         };
 
         // List mailboxes
-        match context.index.list_mailboxes(&username).await {
+        match context.mailboxes.list_mailboxes(&username).await {
             Ok(mailboxes) => {
                 // Filter by pattern (simple wildcard matching)
                 let filtered: Vec<_> = if pattern == "*" {
@@ -81,14 +81,14 @@ impl CommandHandler for ListHandler {
                     let prefix = pattern.trim_end_matches('*');
                     mailboxes
                         .into_iter()
-                        .filter(|m| m.name.starts_with(prefix))
+                        .filter(|m| m.root_path.starts_with(prefix))
                         .collect()
                 };
 
                 // Build response message with list of mailboxes
                 let mut message = String::new();
                 for mailbox in &filtered {
-                    message.push_str(&format!("* LIST () \"/\" \"{}\"\r\n", mailbox.name));
+                    message.push_str(&format!("* LIST () \"/\" \"{}\"\r\n", mailbox.root_path));
                 }
                 message.push_str(&format!("{} OK LIST completed", tag));
 
