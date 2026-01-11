@@ -52,8 +52,8 @@ impl CommandHandler for CapabilityHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use crate::{Authenticator, Index, MailStore, Queue, UserStore};
+    
+    
 
     #[tokio::test]
     async fn test_capability_handler() {

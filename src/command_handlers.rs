@@ -149,7 +149,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use crate::protocol::Response;
-    use crate::session_context::{SessionContext, SessionState};
+    use crate::session_context::SessionContext;
 
     // Mock handler for testing
     struct MockHandler {

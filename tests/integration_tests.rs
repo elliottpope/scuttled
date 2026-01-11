@@ -2,14 +2,14 @@
 
 use futures::stream::StreamExt;
 use scuttled::authenticator::r#impl::BasicAuthenticator;
-use scuttled::index::r#impl::{create_inmemory_index, InMemoryIndex};
+use scuttled::index::r#impl::create_inmemory_index;
 use scuttled::index::IndexedMessage;
 use scuttled::mailboxes::r#impl::InMemoryMailboxes;
 use scuttled::mailstore::r#impl::FilesystemMailStore;
 use scuttled::queue::r#impl::ChannelQueue;
 use scuttled::server::ImapServer;
 use scuttled::userstore::r#impl::SQLiteUserStore;
-use scuttled::{mailboxes, types::*, Mailboxes};
+use scuttled::{types::*, Mailboxes};
 use scuttled::{Authenticator, Index, MailStore, Queue, UserStore};
 use std::sync::Arc;
 use std::time::Duration;
