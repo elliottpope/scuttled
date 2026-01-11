@@ -27,13 +27,17 @@ native-tls = "0.2"
 parking_lot = "0.12"
 signal-hook = "0.3"
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
-notify = { version = "6.1", default-features = false, features = ["macos_fsevent"] }
+notify = { version = "6.1", default-features = false, features = [
+  "macos_fsevent",
+] }
 mailparse = "0.15"
 
 [dev-dependencies]
 tempfile = "3.8"
 serial_test = "3.0"
-async-imap = "0.9"
+async-imap = { version = "0.11.1", features = [
+  "runtime-tokio",
+], default-features = false }
 tokio-native-tls = "0.3"
 rcgen = "0.12"
 pem = "3.0"

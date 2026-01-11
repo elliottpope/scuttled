@@ -1,19 +1,19 @@
 //! Integration tests for the IMAP server using external IMAP client
 
+use futures::stream::StreamExt;
 use scuttled::authenticator::r#impl::BasicAuthenticator;
-use scuttled::index::r#impl::InMemoryIndex;
+use scuttled::index::r#impl::{create_inmemory_index, InMemoryIndex};
 use scuttled::index::IndexedMessage;
 use scuttled::mailboxes::r#impl::InMemoryMailboxes;
 use scuttled::mailstore::r#impl::FilesystemMailStore;
 use scuttled::queue::r#impl::ChannelQueue;
 use scuttled::server::ImapServer;
-use scuttled::types::*;
 use scuttled::userstore::r#impl::SQLiteUserStore;
+use scuttled::{mailboxes, types::*, Mailboxes};
 use scuttled::{Authenticator, Index, MailStore, Queue, UserStore};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
-use futures::stream::StreamExt;
 
 /// Set up a test server and return the temp directory and address
 async fn setup_test_server() -> (TempDir, String) {
@@ -25,20 +25,30 @@ async fn setup_test_server() -> (TempDir, String) {
 
     // Create components using new architecture
     let mail_store = FilesystemMailStore::new(&mail_dir).await.unwrap();
-    let index = InMemoryIndex::new();
     let user_store = Arc::new(SQLiteUserStore::new(&db_path).await.unwrap());
     let queue = ChannelQueue::new();
-    let mailboxes = InMemoryMailboxes::new();
+    let mailboxes = Arc::new(InMemoryMailboxes::new());
+    let index = create_inmemory_index(Some(mailboxes.clone()));
 
     // Set up test user and mailbox
     user_store
         .create_user("testuser", "testpass")
         .await
         .unwrap();
-    index.create_mailbox("testuser", "INBOX").await.unwrap();
+    log::info!("Creating default INBOX...");
+    if let Err(e) = mailboxes.create_mailbox("test", "INBOX").await {
+        log::warn!("Failed to create INBOX (may already exist): {}", e);
+    }
 
     let authenticator = BasicAuthenticator::new(user_store.clone());
-    let server = ImapServer::new(mail_store, index, authenticator, user_store, queue, mailboxes);
+    let server = ImapServer::new(
+        mail_store,
+        index,
+        authenticator,
+        user_store,
+        queue,
+        mailboxes,
+    );
 
     // Bind to a random port
     let addr = "127.0.0.1:0";
@@ -178,7 +188,7 @@ async fn test_imap_append_message() {
     session.select("INBOX").await.unwrap();
 
     let message = b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test\r\n\r\nThis is a test message.";
-    session.append("INBOX", message).await.unwrap();
+    session.append("INBOX", None, None, message).await.unwrap();
 
     // Check that the message was added
     let mailbox = session.examine("INBOX").await.unwrap();
@@ -198,7 +208,7 @@ async fn test_imap_fetch_message() {
     // Append a message first
     let message_content = b"From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: Test Fetch\r\n\r\nTest body.";
     session
-        .append("INBOX", message_content)
+        .append("INBOX", None, None, message_content)
         .await
         .unwrap();
 
@@ -227,11 +237,11 @@ async fn test_imap_expunge() {
 
     // Append two messages
     session
-        .append("INBOX", b"Message 1")
+        .append("INBOX", None, None, b"Message 1")
         .await
         .unwrap();
     session
-        .append("INBOX", b"Message 2")
+        .append("INBOX", None, None, b"Message 2")
         .await
         .unwrap();
 
@@ -291,15 +301,16 @@ async fn test_mailstore_path_based_operations() {
 
 #[tokio::test]
 async fn test_index_metadata_operations() {
-    let index = InMemoryIndex::new();
+    let mailboxes = Arc::new(InMemoryMailboxes::new());
+    let index = create_inmemory_index(Some(mailboxes.clone()));
 
     // Create mailbox
-    index.create_mailbox("alice", "INBOX").await.unwrap();
-    index.create_mailbox("alice", "Sent").await.unwrap();
+    mailboxes.create_mailbox("alice", "INBOX").await.unwrap();
+    mailboxes.create_mailbox("alice", "Sent").await.unwrap();
 
     // List mailboxes
-    let mailboxes = index.list_mailboxes("alice").await.unwrap();
-    assert_eq!(mailboxes.len(), 2);
+    let boxes = mailboxes.list_mailboxes("alice").await.unwrap();
+    assert_eq!(boxes.len(), 2);
 
     // Add message
     let message = IndexedMessage {
@@ -340,8 +351,8 @@ async fn test_index_metadata_operations() {
     assert_eq!(results.len(), 1);
 
     // Delete mailbox
-    index.delete_mailbox("alice", "Sent").await.unwrap();
-    let mailboxes_after = index.list_mailboxes("alice").await.unwrap();
+    mailboxes.delete_mailbox("alice", "Sent").await.unwrap();
+    let mailboxes_after = mailboxes.list_mailboxes("alice").await.unwrap();
     assert_eq!(mailboxes_after.len(), 1);
 
     index.shutdown().await.unwrap();
@@ -459,7 +470,8 @@ async fn test_full_integration_workflow() {
     std::fs::create_dir_all(&mail_dir).unwrap();
 
     let mail_store = FilesystemMailStore::new(&mail_dir).await.unwrap();
-    let index = InMemoryIndex::new();
+    let mailboxes = Arc::new(InMemoryMailboxes::new());
+    let index = create_inmemory_index(Some(mailboxes.clone()));
     let user_store = Arc::new(SQLiteUserStore::new(&db_path).await.unwrap());
     let authenticator = BasicAuthenticator::new(user_store);
 
@@ -479,7 +491,7 @@ async fn test_full_integration_workflow() {
     assert!(auth_result);
 
     // Create mailbox
-    index.create_mailbox("alice", "INBOX").await.unwrap();
+    mailboxes.create_mailbox("alice", "INBOX").await.unwrap();
 
     // Add message via index
     let message = IndexedMessage {
