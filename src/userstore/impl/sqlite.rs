@@ -208,7 +208,7 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_create_and_get_user() {
         let tmpfile = NamedTempFile::new().unwrap();
         let store = SQLiteUserStore::new(tmpfile.path()).await.unwrap();
@@ -220,7 +220,7 @@ mod tests {
         assert_eq!(user.unwrap().username, "testuser");
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_verify_password() {
         let tmpfile = NamedTempFile::new().unwrap();
         let store = SQLiteUserStore::new(tmpfile.path()).await.unwrap();
@@ -234,7 +234,7 @@ mod tests {
         assert!(!invalid);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_update_password() {
         let tmpfile = NamedTempFile::new().unwrap();
         let store = SQLiteUserStore::new(tmpfile.path()).await.unwrap();
@@ -249,7 +249,7 @@ mod tests {
         assert!(!old_invalid);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_delete_user() {
         let tmpfile = NamedTempFile::new().unwrap();
         let store = SQLiteUserStore::new(tmpfile.path()).await.unwrap();
@@ -261,7 +261,7 @@ mod tests {
         assert!(user.is_none());
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_list_users() {
         let tmpfile = NamedTempFile::new().unwrap();
         let store = SQLiteUserStore::new(tmpfile.path()).await.unwrap();

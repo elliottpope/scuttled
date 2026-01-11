@@ -103,7 +103,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_filesystem_store_write_read() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
@@ -114,7 +114,7 @@ mod tests {
         assert_eq!(content, Some(b"Hello, World!".to_vec()));
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_filesystem_store_move() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
@@ -126,7 +126,7 @@ mod tests {
         assert!(store.exists("new.txt").await.unwrap());
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_filesystem_store_remove() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
@@ -138,7 +138,7 @@ mod tests {
         assert!(!store.exists("test.txt").await.unwrap());
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_filesystem_store_clone() {
         let tmp_dir = TempDir::new().unwrap();
         let store1 = FilesystemStore::new(tmp_dir.path()).await.unwrap();

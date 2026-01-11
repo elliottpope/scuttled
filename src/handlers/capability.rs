@@ -55,7 +55,7 @@ mod tests {
     use std::sync::Arc;
     use crate::{Authenticator, Index, MailStore, Queue, UserStore};
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_capability_handler() {
         let handler = CapabilityHandler::new(false);
         assert_eq!(handler.command_name(), "CAPABILITY");

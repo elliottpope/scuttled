@@ -109,7 +109,7 @@ mod tests {
         assert_eq!(LoginHandler::parse_args(""), None);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_login_handler() {
         let handler = LoginHandler::new();
         assert_eq!(handler.command_name(), "LOGIN");

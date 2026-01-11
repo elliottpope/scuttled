@@ -129,7 +129,7 @@ mod tests {
         assert_eq!(ListHandler::parse_args(""), None);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_list_handler() {
         let handler = ListHandler::new();
         assert_eq!(handler.command_name(), "LIST");

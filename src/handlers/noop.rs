@@ -50,7 +50,7 @@ impl CommandHandler for NoopHandler {
 mod tests {
     use super::*;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_noop_handler() {
         let handler = NoopHandler::new();
         assert_eq!(handler.command_name(), "NOOP");

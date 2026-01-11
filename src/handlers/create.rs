@@ -82,7 +82,7 @@ impl CommandHandler for CreateHandler {
 mod tests {
     use super::*;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_create_handler() {
         let handler = CreateHandler::new();
         assert_eq!(handler.command_name(), "CREATE");

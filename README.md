@@ -1,10 +1,10 @@
 # scuttled
 
-An async IMAP server implementation in Rust using `async_std`.
+An async IMAP server implementation in Rust using `tokio`.
 
 ## Features
 
-- **Async/Await**: Built on `async_std` for efficient async I/O
+- **Async/Await**: Built on `tokio` for efficient async I/O
 - **Channel-Based Architecture**: Single-writer pattern using channels eliminates lock contention
 - **Path-Based Storage**: Clean separation between metadata (Index) and content (MailStore)
 - **Modular Design**: Clean trait-based abstractions for all major components
@@ -63,7 +63,7 @@ use scuttled::mailstore::r#impl::FilesystemMailStore;
 use scuttled::queue::r#impl::ChannelQueue;
 use scuttled::userstore::r#impl::SQLiteUserStore;
 
-#[async_std::main]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mail_store = FilesystemMailStore::new("./data/mail").await?;
     let index = InMemoryIndex::new();

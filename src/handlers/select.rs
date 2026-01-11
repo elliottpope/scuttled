@@ -97,7 +97,7 @@ impl CommandHandler for SelectHandler {
 mod tests {
     use super::*;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_select_handler() {
         let handler = SelectHandler::new();
         assert_eq!(handler.command_name(), "SELECT");
