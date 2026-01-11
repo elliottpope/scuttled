@@ -1,8 +1,7 @@
 //! In-memory mailbox registry implementation
 
-use async_std::channel::{bounded, Receiver, Sender};
-use async_std::sync::RwLock;
-use async_std::task;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::RwLock;
 use async_trait::async_trait;
 use futures::channel::oneshot;
 use std::collections::HashMap;
@@ -145,19 +144,19 @@ pub struct InMemoryMailboxes {
 
 impl InMemoryMailboxes {
     pub fn new() -> Self {
-        let (write_tx, write_rx) = bounded(100);
+        let (write_tx, write_rx) = channel(100);
         let state = Arc::new(RwLock::new(MailboxState::new()));
 
         let state_clone = Arc::clone(&state);
-        task::spawn(async move {
+        tokio::spawn(async move {
             Self::writer_loop(state_clone, write_rx).await;
         });
 
         Self { state, write_tx }
     }
 
-    async fn writer_loop(state: Arc<RwLock<MailboxState>>, rx: Receiver<WriteCommand>) {
-        while let Ok(cmd) = rx.recv().await {
+    async fn writer_loop(state: Arc<RwLock<MailboxState>>, mut rx: Receiver<WriteCommand>) {
+        while let Some(cmd) = rx.recv().await {
             match cmd {
                 WriteCommand::Create(username, name, reply) => {
                     let mut state = state.write().await;

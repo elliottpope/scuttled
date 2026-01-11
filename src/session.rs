@@ -2,10 +2,10 @@
 //!
 //! This module contains session-related structures for managing IMAP client connections.
 
-use async_native_tls::TlsAcceptor;
-use async_std::io::BufReader;
-use async_std::prelude::*;
-use async_std::sync::{Arc, RwLock};
+use tokio_native_tls::TlsAcceptor;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::RwLock;
+use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use crate::index::Indexer;
 use crate::protocol::{parse_command, Command, Response};
 use crate::session_context::{SessionContext, SessionState};
 use crate::types::*;
-use crate::{Authenticator, CommandHandlers, Index, MailStore, Mailboxes, Queue, UserStore};
+use crate::{Authenticator, CommandHandlers, MailStore, Mailboxes, Queue, UserStore};
 
 const DEFAULT_MAX_TAG_HISTORY: usize = 10000;
 
@@ -180,11 +180,10 @@ impl Session {
         // Main command processing loop
         loop {
             // Create a new reader for this phase (needed to support STARTTLS upgrade)
-            let reader = BufReader::new(&connection);
-            let mut lines = reader.lines();
+            let mut reader = BufReader::new(&connection);
             let mut should_continue = false;
 
-            while let Some(line) = lines.next().await {
+            loop {
                 self.last_client_interaction = Instant::now();
 
                 // Check session timeouts
@@ -214,8 +213,21 @@ impl Session {
                     return Err(Error::ProtocolError("Session idle timeout".to_string()));
                 }
 
-                let line = match line {
-                    Ok(l) => l,
+                let mut line = String::new();
+                let line_result = reader.read_line(&mut line).await;
+
+                let line: String = match line_result {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        // Remove trailing newline
+                        if line.ends_with('\n') {
+                            line.pop();
+                            if line.ends_with('\r') {
+                                line.pop();
+                            }
+                        }
+                        line
+                    }
                     Err(e) => {
                         eprintln!("Error reading line from {:?}: {}", peer_addr, e);
                         return Ok(());
@@ -297,8 +309,8 @@ impl Session {
 
                     // If we sent OK, upgrade the connection
                     if matches!(response, Response::Ok { .. }) {
-                        // Drop the lines iterator to release the connection
-                        drop(lines);
+                        // Drop the reader to release the connection
+                        drop(reader);
 
                         // Upgrade to TLS
                         connection = connection

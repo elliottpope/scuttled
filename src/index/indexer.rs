@@ -5,12 +5,12 @@
 //! - EventBus integration for reactive updates from FilesystemWatcher
 //! - Unique ID mapping for filesystem-to-index coordination
 
-use async_std::channel::{bounded, Receiver, Sender};
-use async_std::sync::{Arc, RwLock};
-use async_std::task;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::RwLock;
 use futures::channel::oneshot;
 use log::{debug, error, info};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::events::{Event, EventBus, EventKind};
@@ -79,11 +79,11 @@ impl Indexer {
     ) -> Self {
         let backend = Arc::new(RwLock::new(backend));
         let unique_id_mapping = Arc::new(RwLock::new(HashMap::new()));
-        let (write_tx, write_rx) = bounded(100);
+        let (write_tx, write_rx) = channel(100);
 
         // Spawn writer loop
         let backend_clone = backend.clone();
-        task::spawn(writer_loop(write_rx, backend_clone));
+        tokio::spawn(writer_loop(write_rx, backend_clone));
 
         // Spawn event listener if EventBus provided
         if let Some(bus) = event_bus {
@@ -91,7 +91,7 @@ impl Indexer {
             let mapping_clone = unique_id_mapping.clone();
             let write_tx_clone = write_tx.clone();
             let mailboxes_clone = mailboxes.clone();
-            task::spawn(async move {
+            tokio::spawn(async move {
                 if let Err(e) = event_listener(
                     bus,
                     backend_clone,
@@ -211,8 +211,8 @@ impl Indexer {
 }
 
 /// Writer loop that processes write commands serially
-async fn writer_loop(rx: Receiver<WriteCommand>, backend: Arc<RwLock<Box<dyn IndexBackend>>>) {
-    while let Ok(cmd) = rx.recv().await {
+async fn writer_loop(mut rx: Receiver<WriteCommand>, backend: Arc<RwLock<Box<dyn IndexBackend>>>) {
+    while let Some(cmd) = rx.recv().await {
         match cmd {
             WriteCommand::AddMessage(username, mailbox, message, reply) => {
                 let mut backend = backend.write().await;
@@ -253,7 +253,7 @@ async fn event_listener(
     mailboxes: Option<Arc<dyn Mailboxes>>,
 ) -> Result<()> {
     // Subscribe to message and mailbox events
-    let (subscription_id, event_rx) = event_bus
+    let (subscription_id, mut event_rx) = event_bus
         .subscribe(vec![
             EventKind::MessageCreated,
             EventKind::MessageModified,
@@ -268,7 +268,7 @@ async fn event_listener(
     );
 
     // Listen for events
-    while let Ok(delivery) = event_rx.recv().await {
+    while let Some(delivery) = event_rx.recv().await {
         let event = delivery.event().clone();
         match event {
             Event::MessageCreated {

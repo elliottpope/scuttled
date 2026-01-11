@@ -21,7 +21,7 @@ impl SQLiteUserStore {
         let db_path = db_path.as_ref().to_path_buf();
         let db_path_clone = db_path.clone();
 
-        async_std::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path_clone)?;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS users (
@@ -33,7 +33,7 @@ impl SQLiteUserStore {
             )?;
             Ok::<(), Error>(())
         })
-        .await?;
+        .await.map_err(|e| Error::Internal(format!("Task join error: {}", e)))??;
 
         Ok(Self {
             db_path: Arc::new(db_path),
@@ -49,7 +49,7 @@ impl SQLiteUserStore {
         let db_path = PathBuf::from(format!("file:memdb{}?mode=memory&cache=shared", id));
 
         let db_path_clone = db_path.clone();
-        async_std::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path_clone)?;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS users (
@@ -61,7 +61,7 @@ impl SQLiteUserStore {
             )?;
             Ok::<(), Error>(())
         })
-        .await?;
+        .await.map_err(|e| Error::Internal(format!("Task join error: {}", e)))??;
 
         Ok(Self {
             db_path: Arc::new(db_path),
@@ -76,7 +76,7 @@ impl UserStore for SQLiteUserStore {
         let password = password.to_string();
         let db_path = Arc::clone(&self.db_path);
 
-        async_std::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let password_hash = bcrypt::hash(&password, bcrypt::DEFAULT_COST)
                 .map_err(|e| Error::Internal(format!("Failed to hash password: {}", e)))?;
 
@@ -97,14 +97,14 @@ impl UserStore for SQLiteUserStore {
 
             Ok(())
         })
-        .await
+        .await.map_err(|e| Error::Internal(format!("Task join error: {}", e)))?
     }
 
     async fn get_user(&self, username: &str) -> Result<Option<User>> {
         let username = username.to_string();
         let db_path = Arc::clone(&self.db_path);
 
-        async_std::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&*db_path)?;
             let mut stmt = conn
                 .prepare("SELECT username, password_hash, created_at FROM users WHERE username = ?1")?;
@@ -129,7 +129,7 @@ impl UserStore for SQLiteUserStore {
                 Ok(None)
             }
         })
-        .await
+        .await.map_err(|e| Error::Internal(format!("Task join error: {}", e)))?
     }
 
     async fn update_password(&self, username: &str, new_password: &str) -> Result<()> {
@@ -137,7 +137,7 @@ impl UserStore for SQLiteUserStore {
         let new_password = new_password.to_string();
         let db_path = Arc::clone(&self.db_path);
 
-        async_std::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let password_hash = bcrypt::hash(&new_password, bcrypt::DEFAULT_COST)
                 .map_err(|e| Error::Internal(format!("Failed to hash password: {}", e)))?;
 
@@ -153,14 +153,14 @@ impl UserStore for SQLiteUserStore {
 
             Ok(())
         })
-        .await
+        .await.map_err(|e| Error::Internal(format!("Task join error: {}", e)))?
     }
 
     async fn delete_user(&self, username: &str) -> Result<()> {
         let username = username.to_string();
         let db_path = Arc::clone(&self.db_path);
 
-        async_std::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&*db_path)?;
             let affected = conn.execute("DELETE FROM users WHERE username = ?1", params![username])?;
 
@@ -170,13 +170,13 @@ impl UserStore for SQLiteUserStore {
 
             Ok(())
         })
-        .await
+        .await.map_err(|e| Error::Internal(format!("Task join error: {}", e)))?
     }
 
     async fn list_users(&self) -> Result<Vec<Username>> {
         let db_path = Arc::clone(&self.db_path);
 
-        async_std::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&*db_path)?;
             let mut stmt = conn.prepare("SELECT username FROM users")?;
 
@@ -186,17 +186,17 @@ impl UserStore for SQLiteUserStore {
 
             Ok(users)
         })
-        .await
+        .await.map_err(|e| Error::Internal(format!("Task join error: {}", e)))?
     }
 
     async fn verify_password(&self, username: &str, password: &str) -> Result<bool> {
         if let Some(user) = self.get_user(username).await? {
             let password = password.to_string();
-            async_std::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 Ok(bcrypt::verify(&password, &user.password_hash)
                     .map_err(|e| Error::Internal(format!("Failed to verify password: {}", e)))?)
             })
-            .await
+            .await.map_err(|e| Error::Internal(format!("Task join error: {}", e)))?
         } else {
             Ok(false)
         }

@@ -1,7 +1,6 @@
 //! Scuttled IMAP server binary
 
-use async_std::fs;
-use async_std::task::spawn;
+use tokio::fs;
 use futures::prelude::*;
 use scuttled::authenticator::r#impl::BasicAuthenticator;
 use scuttled::index::r#impl::{create_inmemory_index, InMemoryIndex};
@@ -12,11 +11,11 @@ use scuttled::server::ImapServer;
 use scuttled::userstore::r#impl::SQLiteUserStore;
 use scuttled::{Index, Mailboxes, UserStore};
 use signal_hook::consts::signal::*;
-use signal_hook_async_std::Signals;
+use signal_hook_tokio::Signals;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[async_std::main]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
@@ -82,14 +81,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_tls = server.clone();
 
     // Spawn plain IMAP server
-    let _plain_task = spawn(async move {
+    let _plain_task = tokio::spawn(async move {
         if let Err(e) = server_plain.listen(plain_addr).await {
             log::error!("Plain IMAP server error: {}", e);
         }
     });
 
     // Spawn TLS IMAP server
-    let _tls_task = spawn(async move {
+    let _tls_task = tokio::spawn(async move {
         if let Err(e) = server_tls.listen_tls(tls_addr).await {
             log::error!("TLS IMAP server error: {}", e);
         }

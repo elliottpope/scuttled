@@ -37,8 +37,7 @@
 pub mod store_mail;
 pub mod filesystem_store;
 
-use async_std::channel::{bounded, Receiver, Sender};
-use async_std::task;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use futures::channel::oneshot;
 
 use crate::error::{Error, Result};
@@ -116,7 +115,7 @@ where
     /// let writer_future = run_storage_writer_loop(writer_rx, store);
     /// ```
     pub fn new(store: S, format: F) -> (Self, Receiver<StorageCommand>) {
-        let (command_tx, command_rx) = bounded(100);
+        let (command_tx, command_rx) = channel(100);
 
         let storage = Self {
             store,
@@ -263,8 +262,8 @@ where
 /// # Arguments
 /// * `rx` - Command receiver from `Storage::new()`
 /// * `store` - StoreMail implementation to execute commands
-pub async fn run_storage_writer_loop<S: StoreMail>(rx: Receiver<StorageCommand>, store: S) {
-    while let Ok(cmd) = rx.recv().await {
+pub async fn run_storage_writer_loop<S: StoreMail>(mut rx: Receiver<StorageCommand>, store: S) {
+    while let Some(cmd) = rx.recv().await {
         match cmd {
             StorageCommand::Write { path, content, reply } => {
                 let result = store.write(&path, &content).await;
@@ -330,26 +329,26 @@ mod tests {
         }
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_storage_creation() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
         let (storage, writer_rx) = Storage::new(store.clone(), TestFormat);
 
         // Spawn writer loop
-        task::spawn(run_storage_writer_loop(writer_rx, store));
+        tokio::spawn(run_storage_writer_loop(writer_rx, store));
 
         storage.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_storage_store_retrieve() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
         let (storage, writer_rx) = Storage::new(store.clone(), TestFormat);
 
         // Spawn writer loop
-        task::spawn(run_storage_writer_loop(writer_rx, store));
+        tokio::spawn(run_storage_writer_loop(writer_rx, store));
 
         let content = b"Hello, World!";
         storage.store("test/msg.eml", content).await.unwrap();
@@ -360,14 +359,14 @@ mod tests {
         storage.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_storage_delete() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
         let (storage, writer_rx) = Storage::new(store.clone(), TestFormat);
 
         // Spawn writer loop
-        task::spawn(run_storage_writer_loop(writer_rx, store));
+        tokio::spawn(run_storage_writer_loop(writer_rx, store));
 
         storage.store("test/msg.eml", b"content").await.unwrap();
         assert!(storage.exists("test/msg.eml").await.unwrap());
@@ -378,14 +377,14 @@ mod tests {
         storage.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_storage_update_flags() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
         let (storage, writer_rx) = Storage::new(store.clone(), TestFormat);
 
         // Spawn writer loop
-        task::spawn(run_storage_writer_loop(writer_rx, store));
+        tokio::spawn(run_storage_writer_loop(writer_rx, store));
 
         // Store message in new/
         storage
@@ -411,7 +410,7 @@ mod tests {
         storage.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_storage_clone() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemStore::new(tmp_dir.path()).await.unwrap();
@@ -419,7 +418,7 @@ mod tests {
         let storage2 = storage1.clone(); // Cheap clone!
 
         // Spawn writer loop
-        task::spawn(run_storage_writer_loop(writer_rx, store));
+        tokio::spawn(run_storage_writer_loop(writer_rx, store));
 
         storage1.store("test1.eml", b"from storage1").await.unwrap();
         storage2.store("test2.eml", b"from storage2").await.unwrap();

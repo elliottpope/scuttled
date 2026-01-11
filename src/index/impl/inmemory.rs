@@ -339,7 +339,7 @@ mod tests {
             .unwrap();
 
         // Give the event listener a moment to subscribe
-        async_std::task::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Publish a MessageCreated event
         event_bus
@@ -361,7 +361,7 @@ mod tests {
             .unwrap();
 
         // Give the index time to process the event
-        async_std::task::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Verify the message was added to the index
         let messages = index.list_message_paths("alice", "INBOX").await.unwrap();
@@ -380,7 +380,7 @@ mod tests {
             .unwrap();
 
         // Give the index time to process the event
-        async_std::task::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Test MessageDeleted event
         event_bus
@@ -393,7 +393,7 @@ mod tests {
             .unwrap();
 
         // Give the index time to process the event
-        async_std::task::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Verify the message was removed
         let messages = index.list_message_paths("alice", "INBOX").await.unwrap();

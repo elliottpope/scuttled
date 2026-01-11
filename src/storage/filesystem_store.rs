@@ -3,9 +3,9 @@
 //! Simple, direct filesystem operations without channels.
 //! The Storage layer handles write coordination.
 
-use async_std::fs::{self, File};
-use async_std::io::{ReadExt, WriteExt};
-use async_std::path::{Path, PathBuf};
+use tokio::fs::{self, File};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 
 use crate::error::{Error, Result};
@@ -49,7 +49,7 @@ impl StoreMail for FilesystemStore {
         let from_path = self.root.join(from);
         let to_path = self.root.join(to);
 
-        if !from_path.exists().await {
+        if !from_path.try_exists().unwrap_or(false) {
             return Err(Error::NotFound(format!("Source file not found: {}", from)));
         }
 
@@ -65,7 +65,7 @@ impl StoreMail for FilesystemStore {
     async fn remove(&self, path: &str) -> Result<()> {
         let full_path = self.root.join(path);
 
-        if !full_path.exists().await {
+        if !full_path.try_exists().unwrap_or(false) {
             return Err(Error::NotFound(format!("File not found: {}", path)));
         }
 
@@ -80,13 +80,13 @@ impl StoreMail for FilesystemStore {
 
     async fn exists(&self, path: &str) -> Result<bool> {
         let full_path = self.root.join(path);
-        Ok(full_path.exists().await)
+        Ok(full_path.try_exists().unwrap_or(false))
     }
 
     async fn read(&self, path: &str) -> Result<Option<Vec<u8>>> {
         let full_path = self.root.join(path);
 
-        if !full_path.exists().await {
+        if !full_path.try_exists().unwrap_or(false) {
             return Ok(None);
         }
 

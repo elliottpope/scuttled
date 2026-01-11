@@ -33,8 +33,7 @@
 //! let subscription = mailbox.subscribe().await?;
 //! ```
 
-use async_std::channel::{bounded, Receiver, Sender};
-use async_std::task;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use futures::channel::oneshot;
 use std::collections::HashMap;
 
@@ -120,13 +119,13 @@ impl Mailbox {
     /// * `name` - Mailbox name (e.g., "INBOX")
     /// * `uid_validity` - UID validity value for this mailbox instance
     pub async fn new(username: impl Into<String>, name: impl Into<String>, uid_validity: u32) -> Result<Self> {
-        let (command_tx, command_rx) = bounded(100);
+        let (command_tx, command_rx) = channel(100);
 
         let username = username.into();
         let name = name.into();
 
         // Spawn state loop
-        task::spawn(mailbox_state_loop(command_rx, username, name, uid_validity));
+        tokio::spawn(mailbox_state_loop(command_rx, username, name, uid_validity));
 
         Ok(Self { command_tx })
     }
@@ -261,7 +260,7 @@ struct InternalMailboxState {
 ///
 /// All state mutations go through this loop for atomicity.
 async fn mailbox_state_loop(
-    rx: Receiver<MailboxCommand>,
+    mut rx: Receiver<MailboxCommand>,
     username: String,
     name: String,
     uid_validity: u32,
@@ -276,7 +275,7 @@ async fn mailbox_state_loop(
         subscribers: Vec::new(),
     };
 
-    while let Ok(cmd) = rx.recv().await {
+    while let Some(cmd) = rx.recv().await {
         match cmd {
             MailboxCommand::AssignUid { path, reply } => {
                 // Check if path already has a UID
@@ -332,7 +331,7 @@ async fn mailbox_state_loop(
                 let _ = reply.send(snapshot);
             }
             MailboxCommand::Subscribe { reply } => {
-                let (tx, rx) = bounded(100);
+                let (tx, rx) = channel(100);
                 state.subscribers.push(tx);
                 let _ = reply.send(rx);
             }
@@ -355,7 +354,7 @@ async fn mailbox_state_loop(
 mod tests {
     use super::*;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_mailbox_creation() {
         let mailbox = Mailbox::new("alice", "INBOX", 1234567890).await.unwrap();
         let state = mailbox.get_state().await.unwrap();
@@ -369,7 +368,7 @@ mod tests {
         mailbox.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_mailbox_assign_uid() {
         let mailbox = Mailbox::new("alice", "INBOX", 1234567890).await.unwrap();
 
@@ -387,7 +386,7 @@ mod tests {
         mailbox.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_mailbox_get_path() {
         let mailbox = Mailbox::new("alice", "INBOX", 1234567890).await.unwrap();
 
@@ -403,7 +402,7 @@ mod tests {
         mailbox.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_mailbox_get_uid() {
         let mailbox = Mailbox::new("alice", "INBOX", 1234567890).await.unwrap();
 
@@ -419,7 +418,7 @@ mod tests {
         mailbox.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_mailbox_remove_message() {
         let mailbox = Mailbox::new("alice", "INBOX", 1234567890).await.unwrap();
 
@@ -439,7 +438,7 @@ mod tests {
         mailbox.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_mailbox_update_path() {
         let mailbox = Mailbox::new("alice", "INBOX", 1234567890).await.unwrap();
 
@@ -466,7 +465,7 @@ mod tests {
         mailbox.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_mailbox_clone() {
         let mailbox1 = Mailbox::new("alice", "INBOX", 1234567890).await.unwrap();
         let mailbox2 = mailbox1.clone(); // Cheap clone!
@@ -488,7 +487,7 @@ mod tests {
         mailbox1.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_mailbox_subscribe() {
         let mailbox = Mailbox::new("alice", "INBOX", 1234567890).await.unwrap();
 
@@ -510,7 +509,7 @@ mod tests {
         mailbox.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_mailbox_duplicate_path_error() {
         let mailbox = Mailbox::new("alice", "INBOX", 1234567890).await.unwrap();
 

@@ -1,8 +1,8 @@
 //! Channel-based queue implementation
 
-use async_std::channel::{bounded, Receiver, Sender};
-use async_std::sync::{Arc, RwLock};
-use async_std::task;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::RwLock;
+use std::sync::Arc;
 use async_trait::async_trait;
 use futures::channel::oneshot;
 use std::collections::VecDeque;
@@ -33,10 +33,10 @@ pub struct ChannelQueue {
 impl ChannelQueue {
     pub fn new() -> Self {
         let state = Arc::new(RwLock::new(VecDeque::new()));
-        let (write_tx, write_rx) = bounded(100);
+        let (write_tx, write_rx) = channel(100);
 
         let state_clone = Arc::clone(&state);
-        task::spawn(writer_loop(write_rx, state_clone));
+        tokio::spawn(writer_loop(write_rx, state_clone));
 
         Self { state, write_tx }
     }
@@ -48,8 +48,8 @@ impl Default for ChannelQueue {
     }
 }
 
-async fn writer_loop(rx: Receiver<WriteCommand>, state: Arc<RwLock<VecDeque<QueueTask>>>) {
-    while let Ok(cmd) = rx.recv().await {
+async fn writer_loop(mut rx: Receiver<WriteCommand>, state: Arc<RwLock<VecDeque<QueueTask>>>) {
+    while let Some(cmd) = rx.recv().await {
         match cmd {
             WriteCommand::Enqueue(task, reply) => {
                 let mut queue = state.write().await;
@@ -147,7 +147,7 @@ impl Queue for ChannelQueue {
 mod tests {
     use super::*;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_enqueue_and_dequeue() {
         let queue = ChannelQueue::new();
 
@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(dequeued.unwrap().id, task.id);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_peek() {
         let queue = ChannelQueue::new();
 
@@ -174,7 +174,7 @@ mod tests {
         assert_eq!(queue.len().await.unwrap(), 1);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_len_and_is_empty() {
         let queue = ChannelQueue::new();
 
@@ -188,7 +188,7 @@ mod tests {
         assert_eq!(queue.len().await.unwrap(), 1);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_fifo_order() {
         let queue = ChannelQueue::new();
 
@@ -205,7 +205,7 @@ mod tests {
         assert_eq!(second.id, task2.id);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_remove() {
         let queue = ChannelQueue::new();
 
@@ -224,7 +224,7 @@ mod tests {
         assert_eq!(remaining.id, task2.id);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_clear() {
         let queue = ChannelQueue::new();
 
@@ -240,7 +240,7 @@ mod tests {
         assert_eq!(queue.len().await.unwrap(), 0);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_shutdown() {
         let queue = ChannelQueue::new();
         queue.shutdown().await.unwrap();

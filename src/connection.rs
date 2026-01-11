@@ -1,8 +1,8 @@
 //! Connection abstraction for plain and TLS streams
 
-use async_std::net::TcpStream;
-use async_native_tls::{TlsAcceptor, TlsStream};
-use async_std::io::{Read, Write};
+use tokio::net::TcpStream;
+use tokio_native_tls::{TlsAcceptor, TlsStream};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use parking_lot::Mutex;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -59,19 +59,19 @@ impl Connection {
     pub fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         match self {
             Connection::Plain(stream) => stream.lock().peer_addr(),
-            Connection::Tls(stream) => stream.lock().get_ref().peer_addr(),
+            Connection::Tls(stream) => stream.lock().get_ref().get_ref().get_ref().peer_addr(),
         }
     }
 }
 
-// Implement Read for &Connection to support BufReader
+// Implement AsyncRead for &Connection to support BufReader
 // Uses parking_lot::Mutex for interior mutability
-impl Read for &Connection {
+impl AsyncRead for &Connection {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<std::io::Result<usize>> {
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
         match &**self {
             Connection::Plain(stream) => {
                 let mut locked = stream.lock();
@@ -85,9 +85,9 @@ impl Read for &Connection {
     }
 }
 
-// Implement Write for &Connection to support send_response
+// Implement AsyncWrite for &Connection to support send_response
 // Uses parking_lot::Mutex for interior mutability
-impl Write for &Connection {
+impl AsyncWrite for &Connection {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -121,18 +121,18 @@ impl Write for &Connection {
         }
     }
 
-    fn poll_close(
+    fn poll_shutdown(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
         match &**self {
             Connection::Plain(stream) => {
                 let mut locked = stream.lock();
-                Pin::new(&mut *locked).poll_close(cx)
+                Pin::new(&mut *locked).poll_shutdown(cx)
             }
             Connection::Tls(stream) => {
                 let mut locked = stream.lock();
-                Pin::new(&mut *locked).poll_close(cx)
+                Pin::new(&mut *locked).poll_shutdown(cx)
             }
         }
     }
@@ -141,24 +141,24 @@ impl Write for &Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_std::net::{TcpListener, TcpStream};
-    use async_std::prelude::*;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn create_test_connection() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let client_task = async_std::task::spawn(async move {
+        let client_task = tokio::spawn(async move {
             TcpStream::connect(addr).await.unwrap()
         });
 
         let (server_stream, _) = listener.accept().await.unwrap();
-        let client_stream = client_task.await;
+        let client_stream = client_task.await.unwrap();
 
         (server_stream, client_stream)
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_plain_connection() {
         let (stream, _client) = create_test_connection().await;
         let conn = Connection::plain(stream);
@@ -167,7 +167,7 @@ mod tests {
         assert!(conn.peer_addr().is_ok());
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_is_tls() {
         let (stream, _client) = create_test_connection().await;
         let plain_conn = Connection::plain(stream);
@@ -177,7 +177,7 @@ mod tests {
         // but we can verify the enum variant works
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_upgrade_fails_on_tls_connection() {
         // Create a mock TLS acceptor (this will fail but that's ok for the test)
         // We're just testing that upgrade_to_tls returns an error when called on TLS connection
@@ -188,7 +188,7 @@ mod tests {
         // So this test is limited to checking the logic
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_read_write_plain() {
         let (server_stream, mut client_stream) = create_test_connection().await;
         let conn = Connection::plain(server_stream);

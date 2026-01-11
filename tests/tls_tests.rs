@@ -1,8 +1,8 @@
 //! TLS and STARTTLS integration tests
 
-use async_native_tls::TlsConnector;
-use async_std::io::{prelude::*, BufReader};
-use async_std::net::TcpStream;
+use tokio_native_tls::TlsConnector;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use scuttled::authenticator::r#impl::BasicAuthenticator;
 use scuttled::index::r#impl::InMemoryIndex;
 use scuttled::mailboxes::r#impl::InMemoryMailboxes;
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 /// Helper to read a line from the server
-async fn read_line<S: Read + Unpin>(reader: &mut BufReader<S>) -> String {
+async fn read_line<S: AsyncBufReadExt + Unpin>(reader: &mut S) -> String {
     let mut line = String::new();
     reader.read_line(&mut line).await.unwrap();
     line.trim_end().to_string()
@@ -61,7 +61,7 @@ fn generate_test_certificate() -> (Vec<u8>, Vec<u8>) {
     (cert, key)
 }
 
-#[async_std::test]
+#[tokio::test]
 async fn test_starttls_capability_advertised() {
     // Set up test server
     let tmp_dir = TempDir::new().unwrap();
@@ -86,22 +86,23 @@ async fn test_starttls_capability_advertised() {
     );
 
     // Bind to random port
-    let listener = async_std::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
 
     // Spawn server
-    async_std::task::spawn(async move {
+    tokio::spawn(async move {
         let _ = server.listen_on(listener).await;
     });
 
     // Give server time to start
-    async_std::task::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Connect and test CAPABILITY
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let mut reader = BufReader::new(&stream);
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.split();
+    let mut reader = BufReader::new(read_half);
 
     // Read greeting
     let greeting = read_line(&mut reader).await;
@@ -109,8 +110,8 @@ async fn test_starttls_capability_advertised() {
     assert!(greeting.contains("IMAP server ready"));
 
     // Send CAPABILITY command
-    (&stream).write_all(b"A001 CAPABILITY\r\n").await.unwrap();
-    (&stream).flush().await.unwrap();
+    write_half.write_all(b"A001 CAPABILITY\r\n").await.unwrap();
+    write_half.flush().await.unwrap();
 
     let response = read_line(&mut reader).await;
     assert!(response.contains("OK"));
@@ -122,7 +123,7 @@ async fn test_starttls_capability_advertised() {
     );
 }
 
-#[async_std::test]
+#[tokio::test]
 async fn test_starttls_upgrade() {
     // Set up test server with TLS
     let tmp_dir = TempDir::new().unwrap();
@@ -152,30 +153,31 @@ async fn test_starttls_upgrade() {
     .unwrap();
 
     // Bind to random port
-    let listener = async_std::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
 
     // Spawn server
-    async_std::task::spawn(async move {
+    tokio::spawn(async move {
         let _ = server.listen_on(listener).await;
     });
 
     // Give server time to start
-    async_std::task::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Connect
     let stream = TcpStream::connect(addr).await.unwrap();
-    let mut reader = BufReader::new(&stream);
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
     // Read greeting
     let greeting = read_line(&mut reader).await;
     assert!(greeting.contains("OK"));
 
     // Issue STARTTLS
-    (&stream).write_all(b"A001 STARTTLS\r\n").await.unwrap();
-    (&stream).flush().await.unwrap();
+    write_half.write_all(b"A001 STARTTLS\r\n").await.unwrap();
+    write_half.flush().await.unwrap();
 
     let starttls_response = read_line(&mut reader).await;
     assert!(
@@ -190,9 +192,15 @@ async fn test_starttls_upgrade() {
     );
 
     // Now upgrade to TLS
-    drop(reader); // Drop reader to release the stream
+    // Reunite the split stream
+    let stream = reader.into_inner().unsplit(write_half);
 
-    let connector = TlsConnector::new().danger_accept_invalid_certs(true); // Accept self-signed cert for testing
+    let connector = TlsConnector::from(
+        native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap()
+    );
 
     let mut tls_stream = connector
         .connect("localhost", stream)
@@ -224,7 +232,7 @@ async fn test_starttls_upgrade() {
     );
 }
 
-#[async_std::test]
+#[tokio::test]
 async fn test_implicit_tls_connection() {
     // Set up test server with implicit TLS
     let tmp_dir = TempDir::new().unwrap();
@@ -254,23 +262,28 @@ async fn test_implicit_tls_connection() {
     .unwrap();
 
     // Bind to random port for implicit TLS
-    let listener = async_std::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
 
     // Spawn server with implicit TLS
-    async_std::task::spawn(async move {
+    tokio::spawn(async move {
         let _ = server.listen_on_tls(listener).await;
     });
 
     // Give server time to start
-    async_std::task::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Connect with TLS from the start
     let stream = TcpStream::connect(addr).await.unwrap();
 
-    let connector = TlsConnector::new().danger_accept_invalid_certs(true);
+    let connector = TlsConnector::from(
+        native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap()
+    );
 
     let mut tls_stream = connector
         .connect("localhost", stream)
@@ -302,7 +315,7 @@ async fn test_implicit_tls_connection() {
     );
 }
 
-#[async_std::test]
+#[tokio::test]
 async fn test_starttls_not_available_without_tls_config() {
     // Set up test server WITHOUT TLS configuration
     let tmp_dir = TempDir::new().unwrap();
@@ -328,30 +341,31 @@ async fn test_starttls_not_available_without_tls_config() {
     );
 
     // Bind to random port
-    let listener = async_std::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
 
     // Spawn server
-    async_std::task::spawn(async move {
+    tokio::spawn(async move {
         let _ = server.listen_on(listener).await;
     });
 
     // Give server time to start
-    async_std::task::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Connect
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let mut reader = BufReader::new(&stream);
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.split();
+    let mut reader = BufReader::new(read_half);
 
     // Read greeting
     let greeting = read_line(&mut reader).await;
     assert!(greeting.contains("OK"));
 
     // Try to issue STARTTLS (should fail)
-    (&stream).write_all(b"A001 STARTTLS\r\n").await.unwrap();
-    (&stream).flush().await.unwrap();
+    write_half.write_all(b"A001 STARTTLS\r\n").await.unwrap();
+    write_half.flush().await.unwrap();
 
     let response = read_line(&mut reader).await;
     assert!(

@@ -4,12 +4,10 @@
 //! using a pluggable MailboxFormat parser. Index and other components subscribe
 //! to these events to stay synchronized with filesystem changes.
 
-use async_std::channel::{bounded, Receiver, Sender};
-use async_std::fs;
-use async_std::path::Path as AsyncPath;
-use async_std::stream::StreamExt;
-use async_std::sync::RwLock;
-use async_std::task;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::fs;
+use futures::StreamExt;
+use tokio::sync::RwLock;
 use async_trait::async_trait;
 use futures::channel::oneshot;
 use log::{debug, error, info, warn};
@@ -70,18 +68,17 @@ impl FilesystemWatcher {
         let root_path = root_path.as_ref().to_path_buf();
 
         // Create root directory if it doesn't exist
-        let async_root = AsyncPath::new(&root_path);
-        if !async_root.exists().await {
-            fs::create_dir_all(&async_root).await?;
+        if !tokio::fs::try_exists(&root_path).await.unwrap_or(false) {
+            fs::create_dir_all(&root_path).await?;
         }
 
-        let (command_tx, command_rx) = bounded(100);
+        let (command_tx, command_rx) = channel(100);
 
         // Spawn the watcher loop
         let root_clone = root_path.clone();
         let event_bus_clone = event_bus.clone();
         let format_clone = format.clone();
-        task::spawn(watcher_loop(
+        tokio::spawn(watcher_loop(
             command_rx,
             root_clone,
             event_bus_clone,
@@ -141,7 +138,7 @@ impl MailStoreWatcher for FilesystemWatcher {
 
 /// Main watcher loop that processes commands and filesystem events
 async fn watcher_loop(
-    command_rx: Receiver<WatchCommand>,
+    mut command_rx: Receiver<WatchCommand>,
     root: PathBuf,
     event_bus: Arc<EventBus>,
     format: Arc<dyn MailboxFormat>,
@@ -152,14 +149,14 @@ async fn watcher_loop(
     }));
 
     // Create the filesystem event channel
-    let (event_tx, event_rx) = bounded::<Result<notify::Event>>(1000);
+    let (event_tx, event_rx) = channel::<Result<notify::Event>>(1000);
 
     // Spawn the filesystem event processor
     let state_clone = state.clone();
     let event_bus_clone = event_bus.clone();
     let root_clone = root.clone();
     let format_clone = format.clone();
-    task::spawn(event_processor(
+    tokio::spawn(event_processor(
         event_rx,
         state_clone,
         event_bus_clone,
@@ -171,7 +168,7 @@ async fn watcher_loop(
     let event_tx_clone = event_tx.clone();
     let watcher_result = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let event_tx = event_tx_clone.clone();
-        task::block_on(async {
+        tokio::runtime::Handle::current().block_on(async {
             let result = res.map_err(|e| Error::Internal(format!("Watch error: {}", e)));
             let _ = event_tx.send(result).await;
         });
@@ -186,7 +183,7 @@ async fn watcher_loop(
     };
 
     // Process commands
-    while let Ok(cmd) = command_rx.recv().await {
+    while let Some(cmd) = command_rx.recv().await {
         match cmd {
             WatchCommand::Watch {
                 username,
@@ -237,9 +234,8 @@ async fn handle_watch(
     // Create mailbox directories based on format requirements
     for subdir in format.watch_subdirectories() {
         let dir_path = mailbox_path.join(subdir);
-        let async_dir = AsyncPath::new(&dir_path);
-        if !async_dir.exists().await {
-            fs::create_dir_all(&async_dir).await?;
+        if !tokio::fs::try_exists(&dir_path).await.unwrap_or(false) {
+            fs::create_dir_all(&dir_path).await?;
         }
     }
 
@@ -312,19 +308,18 @@ async fn scan_existing_messages(
 
     for subdir in format.watch_subdirectories() {
         let dir_path = mailbox_path.join(subdir);
-        let async_dir = AsyncPath::new(&dir_path);
 
-        if !async_dir.exists().await {
+        if !tokio::fs::try_exists(&dir_path).await.unwrap_or(false) {
             continue;
         }
 
-        let mut entries = fs::read_dir(&async_dir).await?;
-        while let Some(entry) = entries.next().await {
-            let entry = entry?;
+        let mut entries = fs::read_dir(&dir_path).await?;
+        while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            let std_path = path.as_ref();
+            let std_path = path.as_path();
 
-            if !path.is_file().await {
+            let metadata = tokio::fs::metadata(&path).await?;
+            if !metadata.is_file() {
                 continue;
             }
 
@@ -401,13 +396,13 @@ async fn scan_existing_messages(
 
 /// Process filesystem events and publish to event bus
 async fn event_processor(
-    event_rx: Receiver<Result<notify::Event>>,
+    mut event_rx: Receiver<Result<notify::Event>>,
     state: Arc<RwLock<WatcherState>>,
     event_bus: Arc<EventBus>,
     root: PathBuf,
     format: Arc<dyn MailboxFormat>,
 ) {
-    while let Ok(event_result) = event_rx.recv().await {
+    while let Some(event_result) = event_rx.recv().await {
         match event_result {
             Ok(event) => {
                 if let Err(e) =
@@ -471,12 +466,11 @@ async fn handle_create_event(
         debug!("New message detected: {:?}", path);
 
         // Read the message content
-        let async_path = AsyncPath::new(path);
-        if !async_path.exists().await {
+        if !tokio::fs::try_exists(path).await.unwrap_or(false) {
             return Ok(());
         }
 
-        let content = match fs::read(async_path).await {
+        let content = match fs::read(path).await {
             Ok(c) => c,
             Err(e) => {
                 warn!("Failed to read new message file: {}", e);
@@ -623,7 +617,7 @@ mod tests {
     use crate::mailstore::watcher::MaildirFormat;
     use tempfile::TempDir;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_watcher_creation() {
         let tmp_dir = TempDir::new().unwrap();
         let event_bus = Arc::new(EventBus::new());
@@ -633,7 +627,7 @@ mod tests {
         assert!(watcher.is_ok());
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_watch_mailbox() {
         let tmp_dir = TempDir::new().unwrap();
         let event_bus = Arc::new(EventBus::new());

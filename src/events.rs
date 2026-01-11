@@ -23,7 +23,7 @@
 //! let (sub_id, mut rx) = bus.subscribe(vec![EventKind::MessageCreated]).await?;
 //!
 //! // Handle events in background
-//! task::spawn(async move {
+//! tokio::spawn(async move {
 //!     while let Ok(delivery) = rx.recv().await {
 //!         // Process event
 //!         println!("Received: {:?}", delivery.event());
@@ -49,7 +49,7 @@
 //! let (sub_id, mut rx) = bus.subscribe_sync(vec![EventKind::MailboxCreated]).await?;
 //!
 //! // Handle events and acknowledge
-//! task::spawn(async move {
+//! tokio::spawn(async move {
 //!     while let Ok(delivery) = rx.recv().await {
 //!         // Process event
 //!         update_index(delivery.event()).await;
@@ -97,8 +97,7 @@
 //! - Sync subscriptions block the publisher until all subscribers acknowledge
 //! - Mix subscription types carefully to balance latency and consistency
 
-use async_std::channel::{bounded, Receiver, Sender};
-use async_std::task;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use chrono::{DateTime, Utc};
 use futures::channel::oneshot;
 use log::{debug, error, info};
@@ -286,10 +285,10 @@ pub struct EventBus {
 impl EventBus {
     /// Create a new EventBus
     pub fn new() -> Self {
-        let (command_tx, command_rx) = bounded(1000);
+        let (command_tx, command_rx) = channel(1000);
 
         // Spawn the event bus loop
-        task::spawn(event_bus_loop(command_rx));
+        tokio::spawn(event_bus_loop(command_rx));
 
         info!("EventBus initialized");
 
@@ -361,7 +360,7 @@ impl EventBus {
         kinds: Vec<EventKind>,
         subscription_type: SubscriptionType,
     ) -> Result<(SubscriptionId, Receiver<EventDelivery>)> {
-        let (event_tx, event_rx) = bounded(100);
+        let (event_tx, event_rx) = channel(100);
         let (reply_tx, reply_rx) = oneshot::channel();
 
         self.command_tx
@@ -403,10 +402,10 @@ impl EventBus {
 }
 
 /// Main event bus loop
-async fn event_bus_loop(command_rx: Receiver<BusCommand>) {
+async fn event_bus_loop(mut command_rx: Receiver<BusCommand>) {
     let mut subscribers: HashMap<SubscriptionId, Subscriber> = HashMap::new();
 
-    while let Ok(cmd) = command_rx.recv().await {
+    while let Some(cmd) = command_rx.recv().await {
         match cmd {
             BusCommand::Publish { event, reply } => {
                 let result = handle_publish_async(&event, &subscribers).await;
@@ -538,13 +537,13 @@ async fn handle_publish_sync(event: &Event, subscribers: &HashMap<SubscriptionId
 mod tests {
     use super::*;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_event_bus_creation() {
         let bus = EventBus::new();
         bus.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_subscribe_and_publish() {
         let bus = EventBus::new();
 
@@ -575,7 +574,7 @@ mod tests {
         bus.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_multiple_subscribers() {
         let bus = EventBus::new();
 
@@ -617,7 +616,7 @@ mod tests {
         bus.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_event_filtering() {
         let bus = EventBus::new();
 
@@ -664,9 +663,8 @@ mod tests {
         bus.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_sync_subscription() {
-        use async_std::task;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
@@ -681,7 +679,7 @@ mod tests {
             .unwrap();
 
         // Spawn a task to handle the event
-        task::spawn(async move {
+        tokio::spawn(async move {
             let delivery = rx.recv().await.unwrap();
 
             // Verify it's a sync delivery
@@ -716,9 +714,8 @@ mod tests {
         bus.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_publish_sync_waits_for_acknowledgment() {
-        use async_std::task;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         use std::time::Duration;
@@ -734,10 +731,10 @@ mod tests {
             .unwrap();
 
         // Spawn a task to handle the event with a delay
-        task::spawn(async move {
+        tokio::spawn(async move {
             let delivery = rx.recv().await.unwrap();
             // Simulate some processing time
-            task::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             processed_clone.store(true, Ordering::SeqCst);
             delivery.acknowledge();
         });
@@ -755,9 +752,8 @@ mod tests {
         bus.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_mixed_sync_and_async_subscribers() {
-        use async_std::task;
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
 
@@ -771,8 +767,8 @@ mod tests {
             .await
             .unwrap();
         let sync_count_clone = sync_count.clone();
-        task::spawn(async move {
-            while let Ok(delivery) = rx1.recv().await {
+        tokio::spawn(async move {
+            while let Some(delivery) = rx1.recv().await {
                 sync_count_clone.fetch_add(1, Ordering::SeqCst);
                 delivery.acknowledge();
             }
@@ -784,8 +780,8 @@ mod tests {
             .await
             .unwrap();
         let async_count_clone = async_count.clone();
-        task::spawn(async move {
-            while let Ok(delivery) = rx2.recv().await {
+        tokio::spawn(async move {
+            while let Some(delivery) = rx2.recv().await {
                 async_count_clone.fetch_add(1, Ordering::SeqCst);
                 delivery.acknowledge(); // No-op for async
             }
@@ -799,7 +795,7 @@ mod tests {
         bus.publish_sync(event).await.unwrap();
 
         // Give async subscriber time to receive
-        task::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Both should have received the event
         assert_eq!(sync_count.load(Ordering::SeqCst), 1);
@@ -808,9 +804,8 @@ mod tests {
         bus.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_async_publish_does_not_wait() {
-        use async_std::task;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         use std::time::Duration;
@@ -826,10 +821,10 @@ mod tests {
             .unwrap();
 
         // Spawn a task to handle the event with a delay
-        task::spawn(async move {
+        tokio::spawn(async move {
             let delivery = rx.recv().await.unwrap();
             // Simulate some processing time
-            task::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             processed_clone.store(true, Ordering::SeqCst);
             delivery.acknowledge();
         });
@@ -845,15 +840,14 @@ mod tests {
         assert!(!processed.load(Ordering::SeqCst));
 
         // Wait for processing to complete
-        task::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(processed.load(Ordering::SeqCst));
 
         bus.shutdown().await.unwrap();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_multiple_sync_subscribers_all_acknowledged() {
-        use async_std::task;
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
 
@@ -867,8 +861,8 @@ mod tests {
                 .await
                 .unwrap();
             let count_clone = count.clone();
-            task::spawn(async move {
-                while let Ok(delivery) = rx.recv().await {
+            tokio::spawn(async move {
+                while let Some(delivery) = rx.recv().await {
                     count_clone.fetch_add(1, Ordering::SeqCst);
                     delivery.acknowledge();
                 }

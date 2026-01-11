@@ -1,9 +1,8 @@
 //! IMAP server implementation
 
-use async_native_tls::TlsAcceptor;
-use async_std::net::TcpListener;
-use async_std::prelude::*;
-use async_std::sync::Arc;
+use tokio_native_tls::TlsAcceptor;
+use tokio::net::TcpListener;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::command_handlers::CommandHandlers;
@@ -12,7 +11,7 @@ use crate::error::Result;
 use crate::handlers::*;
 use crate::index::Indexer;
 use crate::session::Session;
-use crate::{Authenticator, Index, MailStore, Mailboxes, Queue, UserStore};
+use crate::{Authenticator, MailStore, Mailboxes, Queue, UserStore};
 
 const DEFAULT_MAX_SESSION_DURATION: Duration = Duration::from_secs(3600); // 1 hour
 const DEFAULT_MAX_IDLE_DURATION: Duration = Duration::from_secs(1800); // 30 minutes
@@ -158,22 +157,19 @@ impl ImapServer {
 
     /// Listen on an existing TcpListener (useful for testing)
     pub async fn listen_on(&self, listener: TcpListener) -> Result<()> {
-        let mut incoming = listener.incoming();
-        while let Some(stream) = incoming.next().await {
-            let stream = stream?;
+        loop {
+            let (stream, _) = listener.accept().await?;
             let connection = Connection::plain(stream);
 
             let session = self.new_session();
             let tls_acceptor = self.tls_acceptor.as_ref().map(Arc::clone);
 
-            async_std::task::spawn(async move {
+            tokio::spawn(async move {
                 if let Err(e) = session.handle(connection, tls_acceptor).await {
                     log::error!("Session error: {}", e);
                 }
             });
         }
-
-        Ok(())
     }
 
     /// Start the IMAP server on the specified address with implicit TLS
@@ -194,9 +190,8 @@ impl ImapServer {
         let listener = TcpListener::bind(addr).await?;
         log::info!("IMAP server listening on {} (implicit TLS)", addr);
 
-        let mut incoming = listener.incoming();
-        while let Some(stream) = incoming.next().await {
-            let stream = stream?;
+        loop {
+            let (stream, _) = listener.accept().await?;
 
             // Perform TLS handshake immediately
             let tls_stream = acceptor.accept(stream).await.map_err(|e| {
@@ -208,14 +203,12 @@ impl ImapServer {
             let session = self.new_session();
             let tls_acceptor = Some(Arc::clone(acceptor));
 
-            async_std::task::spawn(async move {
+            tokio::spawn(async move {
                 if let Err(e) = session.handle(connection, tls_acceptor).await {
                     log::error!("Session error: {}", e);
                 }
             });
         }
-
-        Ok(())
     }
 
     /// Listen on an existing TcpListener with implicit TLS (useful for testing)
@@ -232,9 +225,8 @@ impl ImapServer {
             )
         })?;
 
-        let mut incoming = listener.incoming();
-        while let Some(stream) = incoming.next().await {
-            let stream = stream?;
+        loop {
+            let (stream, _) = listener.accept().await?;
 
             // Perform TLS handshake immediately
             let tls_stream = acceptor.accept(stream).await.map_err(|e| {
@@ -246,13 +238,11 @@ impl ImapServer {
             let session = self.new_session();
             let tls_acceptor = Some(Arc::clone(acceptor));
 
-            async_std::task::spawn(async move {
+            tokio::spawn(async move {
                 if let Err(e) = session.handle(connection, tls_acceptor).await {
                     log::error!("Session error: {}", e);
                 }
             });
         }
-
-        Ok(())
     }
 }
