@@ -42,18 +42,18 @@ async fn setup_test_server() -> (TempDir, String) {
 
     // Bind to a random port
     let addr = "127.0.0.1:0";
-    let listener = async_std::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap().to_string();
 
     // Spawn server in background
-    async_std::task::spawn(async move {
+    tokio::spawn(async move {
         if let Err(e) = server.listen_on(listener).await {
             eprintln!("Server error: {}", e);
         }
     });
 
     // Give server time to start
-    async_std::task::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     (tmp_dir, actual_addr)
 }
@@ -62,7 +62,7 @@ async fn setup_test_server() -> (TempDir, String) {
 async fn test_imap_login() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -73,7 +73,7 @@ async fn test_imap_login() {
 async fn test_imap_login_failure() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let result = client.login("testuser", "wrongpass").await;
 
@@ -84,7 +84,7 @@ async fn test_imap_login_failure() {
 async fn test_imap_select_mailbox() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -98,7 +98,7 @@ async fn test_imap_select_mailbox() {
 async fn test_imap_create_mailbox() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -122,7 +122,7 @@ async fn test_imap_create_mailbox() {
 async fn test_imap_list_mailboxes() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -146,7 +146,7 @@ async fn test_imap_list_mailboxes() {
 async fn test_imap_delete_mailbox() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -171,7 +171,7 @@ async fn test_imap_delete_mailbox() {
 async fn test_imap_append_message() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -191,7 +191,7 @@ async fn test_imap_append_message() {
 async fn test_imap_fetch_message() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -221,7 +221,7 @@ async fn test_imap_fetch_message() {
 async fn test_imap_expunge() {
     let (_tmp_dir, addr) = setup_test_server().await;
 
-    let stream = async_std::net::TcpStream::connect(&addr).await.unwrap();
+    let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let client = async_imap::Client::new(stream);
     let mut session = client.login("testuser", "testpass").await.unwrap();
 
@@ -259,7 +259,7 @@ async fn test_imap_expunge() {
 
 // Component-level integration tests (not using IMAP protocol)
 
-#[async_std::test]
+#[tokio::test]
 async fn test_mailstore_path_based_operations() {
     let tmp_dir = TempDir::new().unwrap();
     let mail_dir = tmp_dir.path().join("mail");
@@ -289,7 +289,7 @@ async fn test_mailstore_path_based_operations() {
     mail_store.shutdown().await.unwrap();
 }
 
-#[async_std::test]
+#[tokio::test]
 async fn test_index_metadata_operations() {
     let index = InMemoryIndex::new();
 
@@ -347,7 +347,7 @@ async fn test_index_metadata_operations() {
     index.shutdown().await.unwrap();
 }
 
-#[async_std::test]
+#[tokio::test]
 async fn test_queue_operations() {
     let queue = ChannelQueue::new();
 
@@ -374,7 +374,7 @@ async fn test_queue_operations() {
     queue.shutdown().await.unwrap();
 }
 
-#[async_std::test]
+#[tokio::test]
 async fn test_userstore_operations() {
     let tmp_dir = TempDir::new().unwrap();
     let db_path = tmp_dir.path().join("users.db");
@@ -420,7 +420,7 @@ async fn test_userstore_operations() {
     assert_eq!(users_after.len(), 1);
 }
 
-#[async_std::test]
+#[tokio::test]
 async fn test_authenticator() {
     let tmp_dir = TempDir::new().unwrap();
     let db_path = tmp_dir.path().join("users.db");
@@ -450,7 +450,7 @@ async fn test_authenticator() {
     assert!(!result);
 }
 
-#[async_std::test]
+#[tokio::test]
 async fn test_full_integration_workflow() {
     let tmp_dir = TempDir::new().unwrap();
     let mail_dir = tmp_dir.path().join("mail");

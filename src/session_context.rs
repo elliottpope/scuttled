@@ -3,7 +3,8 @@
 use crate::index::Indexer;
 use crate::types::*;
 use crate::{Authenticator, MailStore, Mailboxes, Queue, UserStore};
-use async_std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Session state
 #[derive(Debug, Clone, PartialEq)]

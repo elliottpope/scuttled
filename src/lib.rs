@@ -1,7 +1,7 @@
 //! Scuttled - An async IMAP server implementation in Rust
 //!
 //! This library provides abstractions and implementations for building
-//! an IMAP server using async Rust with async_std.
+//! an IMAP server using async Rust with tokio.
 
 pub mod authenticator;
 pub mod command_handler;

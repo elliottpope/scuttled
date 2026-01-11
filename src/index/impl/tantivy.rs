@@ -1,11 +1,10 @@
 //! Tantivy-based index implementation
 
-use async_std::channel::{bounded, Receiver, Sender};
-use async_std::path::PathBuf;
-use async_std::task;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use async_trait::async_trait;
 use futures::channel::oneshot;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc as StdArc;
 use tantivy::{
     collector::TopDocs,
@@ -99,11 +98,11 @@ impl TantivyBackedIndex {
             .reader()
             .map_err(|e| Error::Index(format!("Failed to create reader: {}", e)))?;
 
-        let (write_tx, write_rx) = bounded(100);
+        let (write_tx, write_rx) = channel(100);
 
         // Spawn writer loop
         let index_clone = StdArc::clone(&index);
-        task::spawn(writer_loop(write_rx, index_clone));
+        tokio::spawn(writer_loop(write_rx, index_clone));
 
         Ok(Self {
             schema,
@@ -128,7 +127,7 @@ impl TantivyBackedIndex {
     }
 }
 
-async fn writer_loop(rx: Receiver<WriteCommand>, index: StdArc<TantivyIndex>) {
+async fn writer_loop(mut rx: Receiver<WriteCommand>, index: StdArc<TantivyIndex>) {
     // Mailbox state stored separately (not in Tantivy)
     let mut mailboxes: HashMap<String, MailboxState> = HashMap::new();
 
@@ -136,7 +135,7 @@ async fn writer_loop(rx: Receiver<WriteCommand>, index: StdArc<TantivyIndex>) {
         .writer(50_000_000)
         .expect("Failed to create index writer");
 
-    while let Ok(cmd) = rx.recv().await {
+    while let Some(cmd) = rx.recv().await {
         match cmd {
             WriteCommand::CreateMailbox(username, name, reply) => {
                 let key = format!("{}:{}", username, name);

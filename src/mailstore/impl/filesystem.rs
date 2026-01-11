@@ -1,12 +1,11 @@
 //! Filesystem-based mail storage implementation
 
-use async_std::channel::{bounded, Receiver, Sender};
-use async_std::fs::{self, File};
-use async_std::io::{ReadExt, WriteExt};
-use async_std::path::{Path, PathBuf};
-use async_std::task;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::fs::{self, File};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use async_trait::async_trait;
 use futures::channel::oneshot;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::mailstore::MailStore;
@@ -32,11 +31,11 @@ impl FilesystemMailStore {
         let root_path = root_path.as_ref().to_path_buf();
         fs::create_dir_all(&root_path).await?;
 
-        let (write_tx, write_rx) = bounded(100);
+        let (write_tx, write_rx) = channel(100);
 
         // Spawn writer loop for write operations
         let root_clone = root_path.clone();
-        task::spawn(writer_loop(write_rx, root_clone));
+        tokio::spawn(writer_loop(write_rx, root_clone));
 
         Ok(Self {
             root: root_path,
@@ -45,8 +44,8 @@ impl FilesystemMailStore {
     }
 }
 
-async fn writer_loop(rx: Receiver<WriteCommand>, root_path: PathBuf) {
-    while let Ok(cmd) = rx.recv().await {
+async fn writer_loop(mut rx: Receiver<WriteCommand>, root_path: PathBuf) {
+    while let Some(cmd) = rx.recv().await {
         match cmd {
             WriteCommand::Store(path, content, reply) => {
                 let result = store_file(&root_path, &path, &content).await;
@@ -80,7 +79,7 @@ async fn store_file(root: &Path, path: &str, content: &[u8]) -> Result<()> {
 async fn delete_file(root: &Path, path: &str) -> Result<()> {
     let full_path = root.join(path);
 
-    if !full_path.exists().await {
+    if !tokio::fs::try_exists(&full_path).await.unwrap_or(false) {
         return Err(Error::NotFound(format!("File not found: {}", path)));
     }
 
@@ -104,7 +103,7 @@ impl MailStore for FilesystemMailStore {
         // Direct filesystem read - no channel needed
         let full_path = self.root.join(path);
 
-        if !full_path.exists().await {
+        if !tokio::fs::try_exists(&full_path).await.unwrap_or(false) {
             return Ok(None);
         }
 
@@ -128,7 +127,7 @@ impl MailStore for FilesystemMailStore {
     async fn exists(&self, path: &str) -> Result<bool> {
         // Direct filesystem check - no channel needed
         let full_path = self.root.join(path);
-        Ok(full_path.exists().await)
+        Ok(tokio::fs::try_exists(&full_path).await.unwrap_or(false))
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -144,7 +143,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_store_and_retrieve() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemMailStore::new(tmp_dir.path()).await.unwrap();
@@ -158,7 +157,7 @@ mod tests {
         assert_eq!(retrieved, Some(content.to_vec()));
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_retrieve_nonexistent() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemMailStore::new(tmp_dir.path()).await.unwrap();
@@ -167,7 +166,7 @@ mod tests {
         assert_eq!(retrieved, None);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_exists() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemMailStore::new(tmp_dir.path()).await.unwrap();
@@ -179,7 +178,7 @@ mod tests {
         assert!(store.exists(path).await.unwrap());
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_delete() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemMailStore::new(tmp_dir.path()).await.unwrap();
@@ -191,7 +190,7 @@ mod tests {
         assert!(!store.exists(path).await.unwrap());
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_nested_paths() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemMailStore::new(tmp_dir.path()).await.unwrap();
@@ -203,7 +202,7 @@ mod tests {
         assert_eq!(retrieved, Some(b"content".to_vec()));
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_shutdown() {
         let tmp_dir = TempDir::new().unwrap();
         let store = FilesystemMailStore::new(tmp_dir.path()).await.unwrap();
