@@ -1,10 +1,7 @@
 //! TLS and STARTTLS integration tests
 
-use tokio_native_tls::TlsConnector;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use scuttled::authenticator::r#impl::BasicAuthenticator;
-use scuttled::index::r#impl::InMemoryIndex;
+use scuttled::index::r#impl::{create_inmemory_index, InMemoryIndex};
 use scuttled::mailboxes::r#impl::InMemoryMailboxes;
 use scuttled::mailstore::r#impl::FilesystemMailStore;
 use scuttled::queue::r#impl::ChannelQueue;
@@ -12,6 +9,9 @@ use scuttled::server::ImapServer;
 use scuttled::userstore::r#impl::SQLiteUserStore;
 use std::sync::Arc;
 use tempfile::TempDir;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio_native_tls::TlsConnector;
 
 /// Helper to read a line from the server
 async fn read_line<S: AsyncBufReadExt + Unpin>(reader: &mut S) -> String {
@@ -70,10 +70,10 @@ async fn test_starttls_capability_advertised() {
     std::fs::create_dir_all(&mail_dir).unwrap();
 
     let mail_store = FilesystemMailStore::new(&mail_dir).await.unwrap();
-    let index = InMemoryIndex::new();
+    let mailboxes = Arc::new(InMemoryMailboxes::new());
+    let index = create_inmemory_index(Some(mailboxes.clone()));
     let user_store = Arc::new(SQLiteUserStore::new(&db_path).await.unwrap());
     let queue = ChannelQueue::new();
-    let mailboxes = InMemoryMailboxes::new();
     let authenticator = BasicAuthenticator::new(user_store.clone());
 
     let server = ImapServer::new(
@@ -86,9 +86,7 @@ async fn test_starttls_capability_advertised() {
     );
 
     // Bind to random port
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     // Spawn server
@@ -132,10 +130,10 @@ async fn test_starttls_upgrade() {
     std::fs::create_dir_all(&mail_dir).unwrap();
 
     let mail_store = FilesystemMailStore::new(&mail_dir).await.unwrap();
-    let index = InMemoryIndex::new();
+    let mailboxes = Arc::new(InMemoryMailboxes::new());
+    let index = create_inmemory_index(Some(mailboxes.clone()));
     let user_store = Arc::new(SQLiteUserStore::new(&db_path).await.unwrap());
     let queue = ChannelQueue::new();
-    let mailboxes = InMemoryMailboxes::new();
     let authenticator = BasicAuthenticator::new(user_store.clone());
 
     // Generate test certificate
@@ -153,9 +151,7 @@ async fn test_starttls_upgrade() {
     .unwrap();
 
     // Bind to random port
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     // Spawn server
@@ -193,13 +189,13 @@ async fn test_starttls_upgrade() {
 
     // Now upgrade to TLS
     // Reunite the split stream
-    let stream = reader.into_inner().unsplit(write_half);
+    let stream = reader.into_inner().reunite(write_half).unwrap();
 
     let connector = TlsConnector::from(
         native_tls::TlsConnector::builder()
             .danger_accept_invalid_certs(true)
             .build()
-            .unwrap()
+            .unwrap(),
     );
 
     let mut tls_stream = connector
@@ -241,10 +237,10 @@ async fn test_implicit_tls_connection() {
     std::fs::create_dir_all(&mail_dir).unwrap();
 
     let mail_store = FilesystemMailStore::new(&mail_dir).await.unwrap();
-    let index = InMemoryIndex::new();
+    let mailboxes = Arc::new(InMemoryMailboxes::new());
+    let index = create_inmemory_index(Some(mailboxes.clone()));
     let user_store = Arc::new(SQLiteUserStore::new(&db_path).await.unwrap());
     let queue = ChannelQueue::new();
-    let mailboxes = InMemoryMailboxes::new();
     let authenticator = BasicAuthenticator::new(user_store.clone());
 
     // Generate test certificate
@@ -262,9 +258,7 @@ async fn test_implicit_tls_connection() {
     .unwrap();
 
     // Bind to random port for implicit TLS
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     // Spawn server with implicit TLS
@@ -282,7 +276,7 @@ async fn test_implicit_tls_connection() {
         native_tls::TlsConnector::builder()
             .danger_accept_invalid_certs(true)
             .build()
-            .unwrap()
+            .unwrap(),
     );
 
     let mut tls_stream = connector
@@ -324,10 +318,10 @@ async fn test_starttls_not_available_without_tls_config() {
     std::fs::create_dir_all(&mail_dir).unwrap();
 
     let mail_store = FilesystemMailStore::new(&mail_dir).await.unwrap();
-    let index = InMemoryIndex::new();
+    let mailboxes = Arc::new(InMemoryMailboxes::new());
+    let index = create_inmemory_index(Some(mailboxes.clone()));
     let user_store = Arc::new(SQLiteUserStore::new(&db_path).await.unwrap());
     let queue = ChannelQueue::new();
-    let mailboxes = InMemoryMailboxes::new();
     let authenticator = BasicAuthenticator::new(user_store.clone());
 
     // Create server WITHOUT TLS
@@ -341,9 +335,7 @@ async fn test_starttls_not_available_without_tls_config() {
     );
 
     // Bind to random port
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     // Spawn server
