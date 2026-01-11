@@ -15,7 +15,7 @@ use crate::index::Indexer;
 use crate::protocol::{parse_command, Command, Response};
 use crate::session_context::{SessionContext, SessionState};
 use crate::types::*;
-use crate::{Authenticator, CommandHandlers, Index, MailStore, Mailboxes, Queue, UserStore};
+use crate::{Authenticator, CommandHandlers, MailStore, Mailboxes, Queue, UserStore};
 
 const DEFAULT_MAX_TAG_HISTORY: usize = 10000;
 
@@ -61,14 +61,14 @@ impl TagHistory {
 }
 
 /// Lazily initialized map of sequence IDs to UIDs for translating requests
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SequenceIdMap {
     map: Option<HashMap<u32, Uid>>,
 }
 
 impl SequenceIdMap {
     pub fn new() -> Self {
-        Self { map: None }
+        Self::default()
     }
 
     /// Initialize the map with a list of UIDs (in sequence order)
@@ -474,9 +474,9 @@ impl Session {
         response
     }
 
-    async fn send_response(&self, connection: &Connection, response: &Response) -> Result<()> {
+    async fn send_response(&self, mut connection: &Connection, response: &Response) -> Result<()> {
         let response_str = response.to_string();
-        (&*connection).write_all(response_str.as_bytes()).await?;
+        connection.write_all(response_str.as_bytes()).await?;
         Ok(())
     }
 }
