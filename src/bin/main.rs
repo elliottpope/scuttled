@@ -3,7 +3,7 @@
 use tokio::fs;
 use futures::prelude::*;
 use scuttled::authenticator::r#impl::BasicAuthenticator;
-use scuttled::index::r#impl::{create_inmemory_index, InMemoryIndex};
+use scuttled::index::r#impl::create_inmemory_index;
 use scuttled::mailboxes::r#impl::InMemoryMailboxes;
 use scuttled::mailstore::r#impl::FilesystemMailStore;
 use scuttled::queue::r#impl::ChannelQueue;
