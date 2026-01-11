@@ -38,7 +38,7 @@ mod tests {
     use crate::userstore::r#impl::SQLiteUserStore;
     use tempfile::TempDir;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_authenticate_success() {
         let tmp_dir = TempDir::new().unwrap();
         let db_path = tmp_dir.path().join("users.db");
@@ -60,7 +60,7 @@ mod tests {
         assert!(result);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_authenticate_failure() {
         let tmp_dir = TempDir::new().unwrap();
         let db_path = tmp_dir.path().join("users.db");

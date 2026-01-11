@@ -53,7 +53,7 @@ impl CommandHandler for LogoutHandler {
 mod tests {
     use super::*;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_logout_handler() {
         let handler = LogoutHandler::new();
         assert_eq!(handler.command_name(), "LOGOUT");

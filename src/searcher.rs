@@ -135,7 +135,7 @@ mod tests {
         }
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_searcher_creation() {
         let backend = Arc::new(MockSearchBackend);
         let searcher = Searcher::new(backend);
@@ -144,7 +144,7 @@ mod tests {
         let _searcher_clone = searcher.clone();
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_searcher_search() {
         let backend = Arc::new(MockSearchBackend);
         let searcher = Searcher::new(backend);
@@ -154,7 +154,7 @@ mod tests {
         assert_eq!(results.len(), 0);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_searcher_list_mailboxes() {
         let backend = Arc::new(MockSearchBackend);
         let searcher = Searcher::new(backend);

@@ -202,15 +202,15 @@ pub fn create_inmemory_index_with_eventbus(
 mod tests {
     use super::*;
     use crate::events::EventBus;
-    use async_std::sync::Arc;
+    use std::sync::Arc;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_create_index() {
         let _index = create_inmemory_index(None);
         // Index no longer tracks mailboxes - just verify it can be created
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_add_and_retrieve_message() {
         let index = create_inmemory_index(None);
 
@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(retrieved, Some(path));
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_search() {
         let index = create_inmemory_index(None);
 
@@ -267,7 +267,7 @@ mod tests {
         assert_eq!(results.len(), 1);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_delete_message() {
         let index = create_inmemory_index(None);
 
@@ -294,7 +294,7 @@ mod tests {
         assert_eq!(retrieved, None);
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_mailbox_no_initialization_required() {
         let index = create_inmemory_index(None);
 
@@ -321,7 +321,7 @@ mod tests {
         assert!(path.contains("alice/Drafts"));
     }
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_event_bus_integration() {
         use crate::events::Event;
         use crate::mailboxes::r#impl::memory::InMemoryMailboxes;

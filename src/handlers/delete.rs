@@ -90,7 +90,7 @@ impl CommandHandler for DeleteHandler {
 mod tests {
     use super::*;
 
-    #[async_std::test]
+    #[tokio::test]
     async fn test_delete_handler() {
         let handler = DeleteHandler::new();
         assert_eq!(handler.command_name(), "DELETE");

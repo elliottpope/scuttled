@@ -570,7 +570,7 @@ benches/
 
 ### Dependencies
 - Rust 1.70+ (async traits, GATs)
-- async_std runtime
+- tokio runtime
 - Existing test infrastructure
 
 ### Assumptions
