@@ -1,6 +1,7 @@
 //! SELECT command handler
 
 use crate::command_handler::CommandHandler;
+use crate::connection::Connection;
 use crate::error::Result;
 use crate::protocol::Response;
 use crate::session_context::{SessionContext, SessionState};
@@ -33,59 +34,52 @@ impl CommandHandler for SelectHandler {
         &self,
         tag: &str,
         args: &str,
-        context: &mut SessionContext,
-    ) -> Result<Response> {
+        _connection: &Connection,
+        context: &SessionContext,
+        current_state: &SessionState,
+    ) -> Result<(Response, Option<SessionState>)> {
         let mailbox_name = args.trim();
 
         if mailbox_name.is_empty() {
-            return Ok(Response::Bad {
+            return Ok((Response::Bad {
                 tag: Some(tag.to_string()),
                 message: "SELECT requires a mailbox name".to_string(),
-            });
+            }, None));
         }
 
         // Get current username from session state
-        let username = match context.get_state().await {
+        let username = match current_state {
             SessionState::Authenticated { username } => username,
             SessionState::Selected { username, .. } => username,
             _ => {
-                return Ok(Response::No {
+                return Ok((Response::No {
                     tag: Some(tag.to_string()),
                     message: "Not authenticated".to_string(),
-                });
+                }, None));
             }
         };
 
         // Check if mailbox exists
         let mailbox = context
             .mailboxes
-            .get_mailbox(&username, mailbox_name)
+            .get_mailbox(username, mailbox_name)
             .await?;
 
         if mailbox.is_none() {
-            return Ok(Response::No {
+            return Ok((Response::No {
                 tag: Some(tag.to_string()),
                 message: format!("Mailbox does not exist: {}", mailbox_name),
-            });
+            }, None));
         }
 
-        // Update session state to Selected
-        context
-            .set_state(SessionState::Selected {
-                username: username.clone(),
-                mailbox: mailbox_name.to_string(),
-            })
-            .await;
-
-        // Store selected mailbox in context
-        context
-            .set_selected_mailbox(Some(mailbox_name.to_string()))
-            .await;
-
-        Ok(Response::Ok {
+        // Return new Selected state
+        Ok((Response::Ok {
             tag: Some(tag.to_string()),
             message: format!("SELECT completed for {}", mailbox_name),
-        })
+        }, Some(SessionState::Selected {
+            username: username.clone(),
+            mailbox: mailbox_name.to_string(),
+        })))
     }
 
     fn requires_auth(&self) -> bool {

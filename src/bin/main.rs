@@ -9,7 +9,7 @@ use scuttled::mailstore::r#impl::FilesystemMailStore;
 use scuttled::queue::r#impl::ChannelQueue;
 use scuttled::server::ImapServer;
 use scuttled::userstore::r#impl::SQLiteUserStore;
-use scuttled::{Index, Mailboxes, UserStore};
+use scuttled::{Mailboxes, UserStore};
 use signal_hook::consts::signal::*;
 use signal_hook_tokio::Signals;
 use std::path::PathBuf;

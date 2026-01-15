@@ -1,6 +1,7 @@
 //! DELETE command handler
 
 use crate::command_handler::CommandHandler;
+use crate::connection::Connection;
 use crate::error::Result;
 use crate::protocol::Response;
 use crate::session_context::{SessionContext, SessionState};
@@ -33,51 +34,53 @@ impl CommandHandler for DeleteHandler {
         &self,
         tag: &str,
         args: &str,
-        context: &mut SessionContext,
-    ) -> Result<Response> {
+        _connection: &Connection,
+        context: &SessionContext,
+        current_state: &SessionState,
+    ) -> Result<(Response, Option<SessionState>)> {
         let mailbox_name = args.trim();
 
         if mailbox_name.is_empty() {
-            return Ok(Response::Bad {
+            return Ok((Response::Bad {
                 tag: Some(tag.to_string()),
                 message: "DELETE requires a mailbox name".to_string(),
-            });
+            }, None));
         }
 
         // Cannot delete INBOX
         if mailbox_name.eq_ignore_ascii_case("INBOX") {
-            return Ok(Response::No {
+            return Ok((Response::No {
                 tag: Some(tag.to_string()),
                 message: "Cannot delete INBOX".to_string(),
-            });
+            }, None));
         }
 
         // Get current username from session state
-        let username = match context.get_state().await {
+        let username = match current_state {
             SessionState::Authenticated { username } => username,
             SessionState::Selected { username, .. } => username,
             _ => {
-                return Ok(Response::No {
+                return Ok((Response::No {
                     tag: Some(tag.to_string()),
                     message: "Not authenticated".to_string(),
-                });
+                }, None));
             }
         };
 
         // Try to delete the mailbox
         match context
             .mailboxes
-            .delete_mailbox(&username, mailbox_name)
+            .delete_mailbox(username, mailbox_name)
             .await
         {
-            Ok(_) => Ok(Response::Ok {
+            Ok(_) => Ok((Response::Ok {
                 tag: Some(tag.to_string()),
                 message: format!("DELETE completed for {}", mailbox_name),
-            }),
-            Err(e) => Ok(Response::No {
+            }, None)),
+            Err(e) => Ok((Response::No {
                 tag: Some(tag.to_string()),
                 message: format!("DELETE failed: {}", e),
-            }),
+            }, None)),
         }
     }
 

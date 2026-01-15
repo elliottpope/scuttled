@@ -2,9 +2,10 @@
 
 use async_trait::async_trait;
 use crate::command_handler::CommandHandler;
+use crate::connection::Connection;
 use crate::error::Result;
 use crate::protocol::Response;
-use crate::session_context::SessionContext;
+use crate::session_context::{SessionContext, SessionState};
 
 /// Handler for the CAPABILITY command
 ///
@@ -29,8 +30,10 @@ impl CommandHandler for CapabilityHandler {
         &self,
         tag: &str,
         _args: &str,
-        _context: &mut SessionContext,
-    ) -> Result<Response> {
+        _connection: &Connection,
+        _context: &SessionContext,
+        _current_state: &SessionState,
+    ) -> Result<(Response, Option<SessionState>)> {
         let mut capabilities = vec!["IMAP4rev1"];
 
         // Only advertise STARTTLS on non-TLS connections
@@ -38,10 +41,10 @@ impl CommandHandler for CapabilityHandler {
             capabilities.push("STARTTLS");
         }
 
-        Ok(Response::Ok {
+        Ok((Response::Ok {
             tag: Some(tag.to_string()),
             message: format!("CAPABILITY {}", capabilities.join(" ")),
-        })
+        }, None))
     }
 
     fn requires_auth(&self) -> bool {

@@ -70,28 +70,31 @@ impl CommandHandlers {
     /// * `command_name` - The command name
     /// * `tag` - The command tag from the client
     /// * `args` - Arguments to the command
+    /// * `connection` - Borrowed connection for challenge/response interactions
     /// * `context` - The session context
+    /// * `current_state` - The current session state
     ///
     /// # Returns
-    /// * Response from the handler, or a "command not found" error response
+    /// * Tuple of (Response, Option<SessionState>) from the handler, or a "command not found" error response
     pub async fn handle(
         &self,
         command_name: &str,
         tag: &str,
         args: &str,
-        context: &mut SessionContext,
-    ) -> Response {
+        connection: &crate::connection::Connection,
+        context: &SessionContext,
+        current_state: &crate::session_context::SessionState,
+    ) -> (Response, Option<crate::session_context::SessionState>) {
         match self.get(command_name) {
             Some(handler) => {
                 // Check authentication requirement
                 if handler.requires_auth() {
-                    let state = context.get_state().await;
-                    match state {
+                    match current_state {
                         crate::session_context::SessionState::NotAuthenticated => {
-                            return Response::No {
+                            return (Response::No {
                                 tag: Some(tag.to_string()),
                                 message: "Command requires authentication".to_string(),
-                            };
+                            }, None);
                         }
                         _ => {}
                     }
@@ -99,31 +102,30 @@ impl CommandHandlers {
 
                 // Check selected mailbox requirement
                 if handler.requires_selected_mailbox() {
-                    let state = context.get_state().await;
-                    match state {
+                    match current_state {
                         crate::session_context::SessionState::Selected { .. } => {}
                         _ => {
-                            return Response::No {
+                            return (Response::No {
                                 tag: Some(tag.to_string()),
                                 message: "Command requires a selected mailbox".to_string(),
-                            };
+                            }, None);
                         }
                     }
                 }
 
                 // Execute the handler
-                match handler.handle(tag, args, context).await {
-                    Ok(response) => response,
-                    Err(e) => Response::Bad {
+                match handler.handle(tag, args, connection, context, current_state).await {
+                    Ok((response, state_update)) => (response, state_update),
+                    Err(e) => (Response::Bad {
                         tag: Some(tag.to_string()),
                         message: format!("Handler error: {}", e),
-                    },
+                    }, None),
                 }
             }
-            None => Response::Bad {
+            None => (Response::Bad {
                 tag: Some(tag.to_string()),
                 message: format!("Unknown command: {}", command_name),
-            },
+            }, None),
         }
     }
 
@@ -167,12 +169,14 @@ mod tests {
             &self,
             tag: &str,
             _args: &str,
-            _context: &mut SessionContext,
-        ) -> Result<Response> {
-            Ok(Response::Ok {
+            _connection: &crate::connection::Connection,
+            _context: &SessionContext,
+            _current_state: &crate::session_context::SessionState,
+        ) -> Result<(Response, Option<crate::session_context::SessionState>)> {
+            Ok((Response::Ok {
                 tag: Some(tag.to_string()),
                 message: format!("{} completed", self.name),
-            })
+            }, None))
         }
 
         fn requires_auth(&self) -> bool {

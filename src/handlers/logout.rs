@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use crate::command_handler::CommandHandler;
+use crate::connection::Connection;
 use crate::error::Result;
 use crate::protocol::Response;
 use crate::session_context::{SessionContext, SessionState};
@@ -33,15 +34,15 @@ impl CommandHandler for LogoutHandler {
         &self,
         tag: &str,
         _args: &str,
-        context: &mut SessionContext,
-    ) -> Result<Response> {
-        // Set session state to Logout
-        context.set_state(SessionState::Logout).await;
-
-        Ok(Response::Ok {
+        _connection: &Connection,
+        _context: &SessionContext,
+        _current_state: &SessionState,
+    ) -> Result<(Response, Option<SessionState>)> {
+        // Return Logout state
+        Ok((Response::Ok {
             tag: Some(tag.to_string()),
             message: "LOGOUT completed".to_string(),
-        })
+        }, Some(SessionState::Logout)))
     }
 
     fn requires_auth(&self) -> bool {

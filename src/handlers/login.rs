@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use crate::command_handler::CommandHandler;
+use crate::connection::Connection;
 use crate::error::Result;
 use crate::protocol::Response;
 use crate::session_context::{SessionContext, SessionState};
@@ -46,16 +47,18 @@ impl CommandHandler for LoginHandler {
         &self,
         tag: &str,
         args: &str,
-        context: &mut SessionContext,
-    ) -> Result<Response> {
+        _connection: &Connection,
+        context: &SessionContext,
+        _current_state: &SessionState,
+    ) -> Result<(Response, Option<SessionState>)> {
         // Parse username and password
         let (username, password) = match Self::parse_args(args) {
             Some((u, p)) => (u, p),
             None => {
-                return Ok(Response::Bad {
+                return Ok((Response::Bad {
                     tag: Some(tag.to_string()),
                     message: "Invalid LOGIN syntax".to_string(),
-                });
+                }, None));
             }
         };
 
@@ -68,24 +71,22 @@ impl CommandHandler for LoginHandler {
 
         match auth_result {
             Ok(true) => {
-                // Set session state to authenticated
-                context
-                    .set_state(SessionState::Authenticated { username })
-                    .await;
-
-                Ok(Response::Ok {
+                // Return new authenticated state
+                Ok((Response::Ok {
                     tag: Some(tag.to_string()),
                     message: "LOGIN completed".to_string(),
-                })
+                }, Some(SessionState::Authenticated {
+                    username
+                })))
             }
-            Ok(false) => Ok(Response::No {
+            Ok(false) => Ok((Response::No {
                 tag: Some(tag.to_string()),
                 message: "LOGIN failed: invalid credentials".to_string(),
-            }),
-            Err(e) => Ok(Response::No {
+            }, None)),
+            Err(e) => Ok((Response::No {
                 tag: Some(tag.to_string()),
                 message: format!("LOGIN failed: {}", e),
-            }),
+            }, None)),
         }
     }
 
