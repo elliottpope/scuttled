@@ -1,6 +1,7 @@
 //! LIST command handler
 
 use crate::command_handler::CommandHandler;
+use crate::connection::Connection;
 use crate::error::Result;
 use crate::protocol::Response;
 use crate::session_context::{SessionContext, SessionState};
@@ -45,33 +46,35 @@ impl CommandHandler for ListHandler {
         &self,
         tag: &str,
         args: &str,
-        context: &mut SessionContext,
-    ) -> Result<Response> {
+        _connection: &Connection,
+        context: &SessionContext,
+        current_state: &SessionState,
+    ) -> Result<(Response, Option<SessionState>)> {
         // Parse arguments
         let (_reference, pattern) = match Self::parse_args(args) {
             Some((r, p)) => (r, p),
             None => {
-                return Ok(Response::Bad {
+                return Ok((Response::Bad {
                     tag: Some(tag.to_string()),
                     message: "Invalid LIST syntax".to_string(),
-                });
+                }, None));
             }
         };
 
         // Get current username from session state
-        let username = match context.get_state().await {
+        let username = match current_state {
             SessionState::Authenticated { username } => username,
             SessionState::Selected { username, .. } => username,
             _ => {
-                return Ok(Response::No {
+                return Ok((Response::No {
                     tag: Some(tag.to_string()),
                     message: "Not authenticated".to_string(),
-                });
+                }, None));
             }
         };
 
         // List mailboxes
-        match context.mailboxes.list_mailboxes(&username).await {
+        match context.mailboxes.list_mailboxes(username).await {
             Ok(mailboxes) => {
                 // Filter by pattern (simple wildcard matching)
                 let filtered: Vec<_> = if pattern == "*" {
@@ -92,15 +95,15 @@ impl CommandHandler for ListHandler {
                 }
                 message.push_str(&format!("{} OK LIST completed", tag));
 
-                Ok(Response::Ok {
+                Ok((Response::Ok {
                     tag: Some(tag.to_string()),
                     message,
-                })
+                }, None))
             }
-            Err(e) => Ok(Response::No {
+            Err(e) => Ok((Response::No {
                 tag: Some(tag.to_string()),
                 message: format!("LIST failed: {}", e),
-            }),
+            }, None)),
         }
     }
 

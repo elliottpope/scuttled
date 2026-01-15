@@ -2,9 +2,10 @@
 
 use async_trait::async_trait;
 use crate::command_handler::CommandHandler;
+use crate::connection::Connection;
 use crate::error::Result;
 use crate::protocol::Response;
-use crate::session_context::SessionContext;
+use crate::session_context::{SessionContext, SessionState};
 
 /// Handler for the NOOP command
 ///
@@ -33,12 +34,14 @@ impl CommandHandler for NoopHandler {
         &self,
         tag: &str,
         _args: &str,
-        _context: &mut SessionContext,
-    ) -> Result<Response> {
-        Ok(Response::Ok {
+        _connection: &Connection,
+        _context: &SessionContext,
+        _current_state: &SessionState,
+    ) -> Result<(Response, Option<SessionState>)> {
+        Ok((Response::Ok {
             tag: Some(tag.to_string()),
             message: "NOOP completed".to_string(),
-        })
+        }, None))
     }
 
     fn requires_auth(&self) -> bool {
