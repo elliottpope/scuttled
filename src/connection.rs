@@ -2,36 +2,54 @@
 
 use tokio::net::TcpStream;
 use tokio_native_tls::{TlsAcceptor, TlsStream};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use parking_lot::Mutex;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, ReadHalf, WriteHalf};
+use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
+use crate::protocol::Response;
 
 /// A connection that can be either plain TCP or TLS-wrapped
-/// Uses Mutex for thread-safe interior mutability
+/// Uses split reader/writer with BufReader/BufWriter for efficiency
 pub enum Connection {
     /// Plain TCP connection
-    Plain(Mutex<TcpStream>),
+    Plain {
+        reader: Mutex<BufReader<ReadHalf<TcpStream>>>,
+        writer: Mutex<BufWriter<WriteHalf<TcpStream>>>,
+        peer_addr: std::net::SocketAddr,
+    },
     /// TLS-encrypted connection
-    Tls(Mutex<TlsStream<TcpStream>>),
+    Tls {
+        reader: Mutex<BufReader<ReadHalf<TlsStream<TcpStream>>>>,
+        writer: Mutex<BufWriter<WriteHalf<TlsStream<TcpStream>>>>,
+        peer_addr: std::net::SocketAddr,
+    },
 }
 
 impl Connection {
     /// Create a new plain TCP connection
-    pub fn plain(stream: TcpStream) -> Self {
-        Self::Plain(Mutex::new(stream))
+    pub fn plain(stream: TcpStream) -> Result<Self> {
+        let peer_addr = stream.peer_addr()?;
+        let (read_half, write_half) = tokio::io::split(stream);
+        Ok(Self::Plain {
+            reader: Mutex::new(BufReader::new(read_half)),
+            writer: Mutex::new(BufWriter::new(write_half)),
+            peer_addr,
+        })
     }
 
     /// Create a new TLS connection
-    pub fn tls(stream: TlsStream<TcpStream>) -> Self {
-        Self::Tls(Mutex::new(stream))
+    pub fn tls(stream: TlsStream<TcpStream>, peer_addr: std::net::SocketAddr) -> Self {
+        let (read_half, write_half) = tokio::io::split(stream);
+        Self::Tls {
+            reader: Mutex::new(BufReader::new(read_half)),
+            writer: Mutex::new(BufWriter::new(write_half)),
+            peer_addr,
+        }
     }
 
     /// Check if this connection is using TLS
     pub fn is_tls(&self) -> bool {
-        matches!(self, Connection::Tls(_))
+        matches!(self, Connection::Tls { .. })
     }
 
     /// Upgrade a plain connection to TLS
@@ -43,97 +61,85 @@ impl Connection {
     /// - The TLS handshake fails
     pub async fn upgrade_to_tls(self, acceptor: &TlsAcceptor) -> Result<Self> {
         match self {
-            Connection::Plain(stream) => {
-                let tcp_stream = stream.into_inner();
+            Connection::Plain { reader, writer, peer_addr } => {
+                // Unsplit the read and write halves
+                let read_half = reader.into_inner().into_inner();
+                let write_half = writer.into_inner().into_inner();
+                let tcp_stream = read_half.unsplit(write_half);
+
+                // Perform TLS handshake
                 let tls_stream = acceptor.accept(tcp_stream).await
                     .map_err(|e| Error::TlsError(format!("TLS handshake failed: {}", e)))?;
-                Ok(Connection::Tls(Mutex::new(tls_stream)))
+
+                // Create new connection with TLS stream
+                Ok(Connection::tls(tls_stream, peer_addr))
             }
-            Connection::Tls(_) => {
+            Connection::Tls { .. } => {
                 Err(Error::ProtocolError("Connection already using TLS".to_string()))
             }
         }
     }
 
-    /// Get the peer address of the underlying TCP stream
-    pub fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+    /// Read a line from the connection
+    ///
+    /// Reads until \n (removes trailing \r\n)
+    pub async fn read_line(&self, buf: &mut String) -> Result<usize> {
         match self {
-            Connection::Plain(stream) => stream.lock().peer_addr(),
-            Connection::Tls(stream) => stream.lock().get_ref().get_ref().get_ref().peer_addr(),
-        }
-    }
-}
-
-// Implement AsyncRead for &Connection to support BufReader
-// Uses parking_lot::Mutex for interior mutability
-impl AsyncRead for &Connection {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match &**self {
-            Connection::Plain(stream) => {
-                let mut locked = stream.lock();
-                Pin::new(&mut *locked).poll_read(cx, buf)
+            Connection::Plain { reader, .. } => {
+                let mut guard = reader.lock().await;
+                let bytes = guard.read_line(buf).await?;
+                Ok(bytes)
             }
-            Connection::Tls(stream) => {
-                let mut locked = stream.lock();
-                Pin::new(&mut *locked).poll_read(cx, buf)
-            }
-        }
-    }
-}
-
-// Implement AsyncWrite for &Connection to support send_response
-// Uses parking_lot::Mutex for interior mutability
-impl AsyncWrite for &Connection {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match &**self {
-            Connection::Plain(stream) => {
-                let mut locked = stream.lock();
-                Pin::new(&mut *locked).poll_write(cx, buf)
-            }
-            Connection::Tls(stream) => {
-                let mut locked = stream.lock();
-                Pin::new(&mut *locked).poll_write(cx, buf)
+            Connection::Tls { reader, .. } => {
+                let mut guard = reader.lock().await;
+                let bytes = guard.read_line(buf).await?;
+                Ok(bytes)
             }
         }
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match &**self {
-            Connection::Plain(stream) => {
-                let mut locked = stream.lock();
-                Pin::new(&mut *locked).poll_flush(cx)
+    /// Write a response to the connection
+    pub async fn write_response(&self, response: &Response) -> Result<()> {
+        let response_str = response.to_string();
+        match self {
+            Connection::Plain { writer, .. } => {
+                let mut guard = writer.lock().await;
+                guard.write_all(response_str.as_bytes()).await?;
+                guard.flush().await?;
+                Ok(())
             }
-            Connection::Tls(stream) => {
-                let mut locked = stream.lock();
-                Pin::new(&mut *locked).poll_flush(cx)
+            Connection::Tls { writer, .. } => {
+                let mut guard = writer.lock().await;
+                guard.write_all(response_str.as_bytes()).await?;
+                guard.flush().await?;
+                Ok(())
             }
         }
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match &**self {
-            Connection::Plain(stream) => {
-                let mut locked = stream.lock();
-                Pin::new(&mut *locked).poll_shutdown(cx)
+    /// Write raw bytes to the connection
+    pub async fn write_all(&self, buf: &[u8]) -> Result<()> {
+        match self {
+            Connection::Plain { writer, .. } => {
+                let mut guard = writer.lock().await;
+                guard.write_all(buf).await?;
+                guard.flush().await?;
+                Ok(())
             }
-            Connection::Tls(stream) => {
-                let mut locked = stream.lock();
-                Pin::new(&mut *locked).poll_shutdown(cx)
+            Connection::Tls { writer, .. } => {
+                let mut guard = writer.lock().await;
+                guard.write_all(buf).await?;
+                guard.flush().await?;
+                Ok(())
             }
+        }
+    }
+
+    /// Get the peer address of the underlying TCP stream
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Connection::Plain { peer_addr, .. } => Some(*peer_addr),
+            Connection::Tls { peer_addr, .. } => Some(*peer_addr),
         }
     }
 }
@@ -161,45 +167,50 @@ mod tests {
     #[tokio::test]
     async fn test_plain_connection() {
         let (stream, _client) = create_test_connection().await;
-        let conn = Connection::plain(stream);
+        let conn = Connection::plain(stream).unwrap();
 
         assert!(!conn.is_tls());
-        assert!(conn.peer_addr().is_ok());
     }
 
     #[tokio::test]
     async fn test_is_tls() {
         let (stream, _client) = create_test_connection().await;
-        let plain_conn = Connection::plain(stream);
+        let plain_conn = Connection::plain(stream).unwrap();
         assert!(!plain_conn.is_tls());
-
-        // We can't easily test TLS connection without certificates,
-        // but we can verify the enum variant works
-    }
-
-    #[tokio::test]
-    async fn test_upgrade_fails_on_tls_connection() {
-        // Create a mock TLS acceptor (this will fail but that's ok for the test)
-        // We're just testing that upgrade_to_tls returns an error when called on TLS connection
-
-        // For this test, we'll create a plain connection first, then verify
-        // that calling upgrade twice would fail
-        // Note: We can't actually do a full TLS handshake without proper certificates
-        // So this test is limited to checking the logic
     }
 
     #[tokio::test]
     async fn test_read_write_plain() {
         let (server_stream, mut client_stream) = create_test_connection().await;
-        let conn = Connection::plain(server_stream);
+        let conn = Connection::plain(server_stream).unwrap();
 
         // Write from client
-        client_stream.write_all(b"Hello").await.unwrap();
+        client_stream.write_all(b"Hello\n").await.unwrap();
         client_stream.flush().await.unwrap();
 
         // Read from server connection
-        let mut buf = [0u8; 5];
-        (&conn).read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"Hello");
+        let mut buf = String::new();
+        conn.read_line(&mut buf).await.unwrap();
+        assert_eq!(buf.trim(), "Hello");
+    }
+
+    #[tokio::test]
+    async fn test_write_response() {
+        let (server_stream, mut client_stream) = create_test_connection().await;
+        let conn = Connection::plain(server_stream).unwrap();
+
+        // Write response from server
+        let response = Response::Ok {
+            tag: Some("A001".to_string()),
+            message: "Test message".to_string(),
+        };
+        conn.write_response(&response).await.unwrap();
+
+        // Read from client
+        let mut buf = vec![0u8; 1024];
+        let n = client_stream.read(&mut buf).await.unwrap();
+        let received = String::from_utf8_lossy(&buf[..n]);
+        assert!(received.contains("A001"));
+        assert!(received.contains("Test message"));
     }
 }

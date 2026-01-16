@@ -14,18 +14,18 @@ pub trait CommandHandler: Send + Sync {
     /// The name of the command this handler processes (e.g., "CAPABILITY", "MYCUSTOMCMD")
     fn command_name(&self) -> &str;
 
-    /// Handle the command and return a response with optional state update
+    /// Handle the command and optionally return a state update
+    ///
+    /// Handlers write responses directly to the connection and return an optional new state.
     ///
     /// # Arguments
     /// * `tag` - The command tag from the client
     /// * `args` - Arguments to the command (everything after the command name)
-    /// * `connection` - Borrowed connection for challenge/response interactions
+    /// * `connection` - Borrowed connection for writing responses and challenge/response interactions
     /// * `context` - The session context with access to stores and state
     /// * `current_state` - The current session state
     ///
     /// # Returns
-    /// A tuple containing:
-    /// * `Response` - The response to send to the client
     /// * `Option<SessionState>` - New state if it should be updated, None otherwise
     async fn handle(
         &self,
@@ -34,7 +34,7 @@ pub trait CommandHandler: Send + Sync {
         connection: &Connection,
         context: &SessionContext,
         current_state: &SessionState,
-    ) -> Result<(Response, Option<SessionState>)>;
+    ) -> Result<Option<SessionState>>;
 
     /// Whether this command requires authentication
     /// Default: true (most commands require auth)

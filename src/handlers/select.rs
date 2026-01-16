@@ -34,17 +34,19 @@ impl CommandHandler for SelectHandler {
         &self,
         tag: &str,
         args: &str,
-        _connection: &Connection,
+        connection: &Connection,
         context: &SessionContext,
         current_state: &SessionState,
-    ) -> Result<(Response, Option<SessionState>)> {
+    ) -> Result<Option<SessionState>> {
         let mailbox_name = args.trim();
 
         if mailbox_name.is_empty() {
-            return Ok((Response::Bad {
+            let response = Response::Bad {
                 tag: Some(tag.to_string()),
                 message: "SELECT requires a mailbox name".to_string(),
-            }, None));
+            };
+            connection.write_response(&response).await?;
+            return Ok(None);
         }
 
         // Get current username from session state
@@ -52,10 +54,12 @@ impl CommandHandler for SelectHandler {
             SessionState::Authenticated { username } => username,
             SessionState::Selected { username, .. } => username,
             _ => {
-                return Ok((Response::No {
+                let response = Response::No {
                     tag: Some(tag.to_string()),
                     message: "Not authenticated".to_string(),
-                }, None));
+                };
+                connection.write_response(&response).await?;
+                return Ok(None);
             }
         };
 
@@ -66,20 +70,26 @@ impl CommandHandler for SelectHandler {
             .await?;
 
         if mailbox.is_none() {
-            return Ok((Response::No {
+            let response = Response::No {
                 tag: Some(tag.to_string()),
                 message: format!("Mailbox does not exist: {}", mailbox_name),
-            }, None));
+            };
+            connection.write_response(&response).await?;
+            return Ok(None);
         }
 
-        // Return new Selected state
-        Ok((Response::Ok {
+        // Write success response
+        let response = Response::Ok {
             tag: Some(tag.to_string()),
             message: format!("SELECT completed for {}", mailbox_name),
-        }, Some(SessionState::Selected {
+        };
+        connection.write_response(&response).await?;
+
+        // Return new Selected state
+        Ok(Some(SessionState::Selected {
             username: username.clone(),
             mailbox: mailbox_name.to_string(),
-        })))
+        }))
     }
 
     fn requires_auth(&self) -> bool {

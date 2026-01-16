@@ -34,15 +34,25 @@ impl CommandHandler for LogoutHandler {
         &self,
         tag: &str,
         _args: &str,
-        _connection: &Connection,
+        connection: &Connection,
         _context: &SessionContext,
         _current_state: &SessionState,
-    ) -> Result<(Response, Option<SessionState>)> {
-        // Return Logout state
-        Ok((Response::Ok {
+    ) -> Result<Option<SessionState>> {
+        // Write BYE response
+        let response = Response::Bye {
+            message: "Logging out".to_string(),
+        };
+        connection.write_response(&response).await?;
+
+        // Write OK response
+        let response = Response::Ok {
             tag: Some(tag.to_string()),
             message: "LOGOUT completed".to_string(),
-        }, Some(SessionState::Logout)))
+        };
+        connection.write_response(&response).await?;
+
+        // Return Logout state
+        Ok(Some(SessionState::Logout))
     }
 
     fn requires_auth(&self) -> bool {

@@ -159,7 +159,13 @@ impl ImapServer {
     pub async fn listen_on(&self, listener: TcpListener) -> Result<()> {
         loop {
             let (stream, _) = listener.accept().await?;
-            let connection = Connection::plain(stream);
+            let connection = match Connection::plain(stream) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    log::error!("Failed to create connection: {}", e);
+                    continue;
+                }
+            };
 
             let session = self.new_session();
             let tls_acceptor = self.tls_acceptor.as_ref().map(Arc::clone);
@@ -191,14 +197,14 @@ impl ImapServer {
         log::info!("IMAP server listening on {} (implicit TLS)", addr);
 
         loop {
-            let (stream, _) = listener.accept().await?;
+            let (stream, addr) = listener.accept().await?;
 
             // Perform TLS handshake immediately
             let tls_stream = acceptor.accept(stream).await.map_err(|e| {
                 crate::error::Error::TlsError(format!("TLS handshake failed: {}", e))
             })?;
 
-            let connection = Connection::tls(tls_stream);
+            let connection = Connection::tls(tls_stream, addr);
 
             let session = self.new_session();
             let tls_acceptor = Some(Arc::clone(acceptor));
@@ -226,14 +232,14 @@ impl ImapServer {
         })?;
 
         loop {
-            let (stream, _) = listener.accept().await?;
+            let (stream, addr) = listener.accept().await?;
 
             // Perform TLS handshake immediately
             let tls_stream = acceptor.accept(stream).await.map_err(|e| {
                 crate::error::Error::TlsError(format!("TLS handshake failed: {}", e))
             })?;
 
-            let connection = Connection::tls(tls_stream);
+            let connection = Connection::tls(tls_stream, addr);
 
             let session = self.new_session();
             let tls_acceptor = Some(Arc::clone(acceptor));

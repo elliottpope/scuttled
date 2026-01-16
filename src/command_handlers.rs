@@ -75,7 +75,9 @@ impl CommandHandlers {
     /// * `current_state` - The current session state
     ///
     /// # Returns
-    /// * Tuple of (Response, Option<SessionState>) from the handler, or a "command not found" error response
+    /// * Option<SessionState> from the handler (None if no state change)
+    ///
+    /// Note: Responses are written directly to the connection by handlers
     pub async fn handle(
         &self,
         command_name: &str,
@@ -84,17 +86,19 @@ impl CommandHandlers {
         connection: &crate::connection::Connection,
         context: &SessionContext,
         current_state: &crate::session_context::SessionState,
-    ) -> (Response, Option<crate::session_context::SessionState>) {
+    ) -> Option<crate::session_context::SessionState> {
         match self.get(command_name) {
             Some(handler) => {
                 // Check authentication requirement
                 if handler.requires_auth() {
                     match current_state {
                         crate::session_context::SessionState::NotAuthenticated => {
-                            return (Response::No {
+                            let response = Response::No {
                                 tag: Some(tag.to_string()),
                                 message: "Command requires authentication".to_string(),
-                            }, None);
+                            };
+                            let _ = connection.write_response(&response).await;
+                            return None;
                         }
                         _ => {}
                     }
@@ -105,27 +109,37 @@ impl CommandHandlers {
                     match current_state {
                         crate::session_context::SessionState::Selected { .. } => {}
                         _ => {
-                            return (Response::No {
+                            let response = Response::No {
                                 tag: Some(tag.to_string()),
                                 message: "Command requires a selected mailbox".to_string(),
-                            }, None);
+                            };
+                            let _ = connection.write_response(&response).await;
+                            return None;
                         }
                     }
                 }
 
                 // Execute the handler
                 match handler.handle(tag, args, connection, context, current_state).await {
-                    Ok((response, state_update)) => (response, state_update),
-                    Err(e) => (Response::Bad {
-                        tag: Some(tag.to_string()),
-                        message: format!("Handler error: {}", e),
-                    }, None),
+                    Ok(state_update) => state_update,
+                    Err(e) => {
+                        let response = Response::Bad {
+                            tag: Some(tag.to_string()),
+                            message: format!("Handler error: {}", e),
+                        };
+                        let _ = connection.write_response(&response).await;
+                        None
+                    }
                 }
             }
-            None => (Response::Bad {
-                tag: Some(tag.to_string()),
-                message: format!("Unknown command: {}", command_name),
-            }, None),
+            None => {
+                let response = Response::Bad {
+                    tag: Some(tag.to_string()),
+                    message: format!("Unknown command: {}", command_name),
+                };
+                let _ = connection.write_response(&response).await;
+                None
+            }
         }
     }
 
@@ -169,14 +183,16 @@ mod tests {
             &self,
             tag: &str,
             _args: &str,
-            _connection: &crate::connection::Connection,
+            connection: &crate::connection::Connection,
             _context: &SessionContext,
             _current_state: &crate::session_context::SessionState,
-        ) -> Result<(Response, Option<crate::session_context::SessionState>)> {
-            Ok((Response::Ok {
+        ) -> Result<Option<crate::session_context::SessionState>> {
+            let response = Response::Ok {
                 tag: Some(tag.to_string()),
                 message: format!("{} completed", self.name),
-            }, None))
+            };
+            connection.write_response(&response).await?;
+            Ok(None)
         }
 
         fn requires_auth(&self) -> bool {

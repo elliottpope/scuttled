@@ -34,17 +34,19 @@ impl CommandHandler for CreateHandler {
         &self,
         tag: &str,
         args: &str,
-        _connection: &Connection,
+        connection: &Connection,
         context: &SessionContext,
         current_state: &SessionState,
-    ) -> Result<(Response, Option<SessionState>)> {
+    ) -> Result<Option<SessionState>> {
         let mailbox_name = args.trim();
 
         if mailbox_name.is_empty() {
-            return Ok((Response::Bad {
+            let response = Response::Bad {
                 tag: Some(tag.to_string()),
                 message: "CREATE requires a mailbox name".to_string(),
-            }, None));
+            };
+            connection.write_response(&response).await?;
+            return Ok(None);
         }
 
         // Get current username from session state
@@ -52,10 +54,12 @@ impl CommandHandler for CreateHandler {
             SessionState::Authenticated { username } => username,
             SessionState::Selected { username, .. } => username,
             _ => {
-                return Ok((Response::No {
+                let response = Response::No {
                     tag: Some(tag.to_string()),
                     message: "Not authenticated".to_string(),
-                }, None));
+                };
+                connection.write_response(&response).await?;
+                return Ok(None);
             }
         };
 
@@ -65,14 +69,22 @@ impl CommandHandler for CreateHandler {
             .create_mailbox(username, mailbox_name)
             .await
         {
-            Ok(_) => Ok((Response::Ok {
-                tag: Some(tag.to_string()),
-                message: format!("CREATE completed for {}", mailbox_name),
-            }, None)),
-            Err(e) => Ok((Response::No {
-                tag: Some(tag.to_string()),
-                message: format!("CREATE failed: {}", e),
-            }, None)),
+            Ok(_) => {
+                let response = Response::Ok {
+                    tag: Some(tag.to_string()),
+                    message: format!("CREATE completed for {}", mailbox_name),
+                };
+                connection.write_response(&response).await?;
+                Ok(None)
+            }
+            Err(e) => {
+                let response = Response::No {
+                    tag: Some(tag.to_string()),
+                    message: format!("CREATE failed: {}", e),
+                };
+                connection.write_response(&response).await?;
+                Ok(None)
+            }
         }
     }
 
