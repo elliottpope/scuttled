@@ -165,7 +165,7 @@ impl Session {
         mut connection: Connection,
         tls_acceptor: Option<Arc<TlsAcceptor>>,
     ) -> Result<()> {
-        let peer_addr = connection.peer_addr().ok();
+        let peer_addr = connection.peer_addr();
 
         // Create channels for untagged responses and shutdown signal
         let (_untagged_tx, mut untagged_rx) = mpsc::channel::<Response>(100);
@@ -176,7 +176,7 @@ impl Session {
             tag: None,
             message: "IMAP server ready".to_string(),
         };
-        if let Err(e) = Self::send_response_static(&connection, &greeting).await {
+        if let Err(e) = connection.write_response( &greeting).await {
             eprintln!("Failed to send greeting: {}", e);
             return Err(e);
         }
@@ -207,54 +207,48 @@ impl Session {
 
         // Main command processing loop with tokio::select!
         loop {
-            // Create a new reader for this phase
-            let mut reader = BufReader::new(&connection);
+            last_client_interaction = Instant::now();
 
-            loop {
-                last_client_interaction = Instant::now();
+            // Check session timeouts
+            if session_started.elapsed() > max_session_duration {
+                let _ = connection.write_response(
+                    &Response::Bye {
+                        message: "Session duration exceeded".to_string(),
+                    },
+                )
+                .await;
+                return Err(Error::ProtocolError(
+                    "Session duration exceeded".to_string(),
+                ));
+            }
 
-                // Check session timeouts
-                if session_started.elapsed() > max_session_duration {
-                    let _ = Self::send_response_static(
-                        &connection,
-                        &Response::Bye {
-                            message: "Session duration exceeded".to_string(),
-                        },
-                    )
-                    .await;
-                    return Err(Error::ProtocolError(
-                        "Session duration exceeded".to_string(),
-                    ));
-                }
+            if last_client_interaction.elapsed() > max_idle_duration {
+                let _ = connection.write_response(
+                    &Response::Bye {
+                        message: "Session idle timeout".to_string(),
+                    },
+                )
+                .await;
+                return Err(Error::ProtocolError("Session idle timeout".to_string()));
+            }
 
-                if last_client_interaction.elapsed() > max_idle_duration {
-                    let _ = Self::send_response_static(
-                        &connection,
-                        &Response::Bye {
-                            message: "Session idle timeout".to_string(),
-                        },
-                    )
-                    .await;
-                    return Err(Error::ProtocolError("Session idle timeout".to_string()));
-                }
+            // Use tokio::select! to handle three futures
+            let mut line = String::new();
 
-                // Use tokio::select! to handle three futures
-                let mut line = String::new();
-
-                tokio::select! {
-                    // 1. Incoming untagged responses
-                    untagged = untagged_rx.recv() => {
-                        if let Some(response) = untagged {
-                            if let Err(e) = Self::send_response_static(&connection, &response).await {
-                                eprintln!("Error sending untagged response: {}", e);
-                                return Ok(());
-                            }
+            tokio::select! {
+                // 1. Incoming untagged responses
+                untagged = untagged_rx.recv() => {
+                    if let Some(response) = untagged {
+                        if let Err(e) = connection.write_response(&response).await {
+                            eprintln!("Error sending untagged response: {}", e);
+                            return Ok(());
                         }
-                        continue;
                     }
+                    continue;
+                }
 
-                    // 2. Incoming lines from TcpStream
-                    line_result = reader.read_line(&mut line) => {
+                // 2. Incoming lines from TcpStream
+                line_result = connection.read_line(&mut line) => {
                         let line: String = match line_result {
                             Ok(0) => return Ok(()), // EOF
                             Ok(_) => {
@@ -276,8 +270,7 @@ impl Session {
                         // Parse tag and command
                         let parts: Vec<&str> = line.splitn(2, ' ').collect();
                         if parts.len() < 2 {
-                            let _ = Self::send_response_static(
-                                &connection,
+                            let _ = connection.write_response(
                                 &Response::Bad {
                                     tag: None,
                                     message: "Invalid command format".to_string(),
@@ -292,8 +285,7 @@ impl Session {
 
                         // Register tag
                         if let Err(e) = tag_history.register(tag.clone()) {
-                            let _ = Self::send_response_static(
-                                &connection,
+                            let _ = connection.write_response(
                                 &Response::Bad {
                                     tag: Some(tag),
                                     message: format!("Tag error: {}", e),
@@ -307,8 +299,7 @@ impl Session {
                         let command = match parse_command(&tag, command_line) {
                             Ok(cmd) => cmd,
                             Err(e) => {
-                                let _ = Self::send_response_static(
-                                    &connection,
+                                let _ = connection.write_response(
                                     &Response::Bad {
                                         tag: Some(tag),
                                         message: format!("Parse error: {}", e),
@@ -338,31 +329,25 @@ impl Session {
                                 }
                             };
 
-                            if let Err(e) = Self::send_response_static(&connection, &response).await {
+                            if let Err(e) = connection.write_response( &response).await {
                                 eprintln!("Error sending STARTTLS response: {}", e);
                                 return Ok(());
                             }
 
                             // If we sent OK, upgrade the connection
                             if matches!(response, Response::Ok { .. }) {
-                                // Drop the reader to release the connection
-                                drop(reader);
-
                                 // Upgrade to TLS
                                 connection = connection
                                     .upgrade_to_tls(tls_acceptor.as_ref().unwrap())
                                     .await?;
                                 log::info!("Connection upgraded to TLS for {:?}", peer_addr);
-
-                                // Break inner loop to recreate reader with upgraded connection
-                                break;
                             }
 
                             continue;
                         }
 
-                        // Handle all other commands
-                        let (response, state_update) = Self::handle_command_static(
+                        // Handle all other commands (handlers write responses directly)
+                        let state_update = Self::handle_command_static(
                             &tag,
                             command,
                             &connection,
@@ -374,24 +359,17 @@ impl Session {
 
                         // Update session state if necessary
                         if let Some(new_state) = state_update {
+                            // Check for LOGOUT state
+                            if matches!(new_state, SessionState::Logout) {
+                                return Ok(());
+                            }
                             session_state = new_state;
-                        }
-
-                        if let Err(e) = Self::send_response_static(&connection, &response).await {
-                            eprintln!("Error sending response: {}", e);
-                            return Ok(());
-                        }
-
-                        // Check for LOGOUT
-                        if matches!(response, Response::Bye { .. }) {
-                            return Ok(());
                         }
                     }
 
                     // 3. Shutdown signal
                     _ = shutdown_rx.recv() => {
-                        let _ = Self::send_response_static(
-                            &connection,
+                        let _ = connection.write_response(
                             &Response::Bye {
                                 message: "Server shutdown".to_string(),
                             },
@@ -400,7 +378,6 @@ impl Session {
                         return Ok(());
                     }
                 }
-            }
         }
     }
 
@@ -412,7 +389,7 @@ impl Session {
         command_handlers: &CommandHandlers,
         context: &SessionContext,
         current_state: &SessionState,
-    ) -> (Response, Option<SessionState>) {
+    ) -> Option<SessionState> {
         // Extract command name and arguments from Command enum
         // Store owned strings to avoid lifetime issues
         let owned_name;
@@ -422,10 +399,12 @@ impl Session {
             Command::Logout => ("LOGOUT", String::new()),
             Command::Starttls => {
                 // STARTTLS is handled specially in the main loop, shouldn't reach here
-                return (Response::Bad {
+                let response = Response::Bad {
                     tag: Some(tag.to_string()),
                     message: "STARTTLS handling error".to_string(),
-                }, None);
+                };
+                let _ = connection.write_response(&response).await;
+                return None;
             }
             Command::Login { username, password } => {
                 ("LOGIN", format!("{} {}", username, password))
@@ -439,22 +418,18 @@ impl Session {
                 (owned_name.as_str(), args)
             }
             _ => {
-                return (Response::Bad {
+                let response = Response::Bad {
                     tag: Some(tag.to_string()),
                     message: "Command not yet implemented".to_string(),
-                }, None);
+                };
+                let _ = connection.write_response(&response).await;
+                return None;
             }
         };
 
-        // Delegate to command handlers registry
+        // Delegate to command handlers registry (handlers write responses directly)
         command_handlers
             .handle(command_name, tag, &args, connection, context, current_state)
             .await
-    }
-
-    async fn send_response_static(mut connection: &Connection, response: &Response) -> Result<()> {
-        let response_str = response.to_string();
-        connection.write_all(response_str.as_bytes()).await?;
-        Ok(())
     }
 }

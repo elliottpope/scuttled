@@ -34,14 +34,16 @@ impl CommandHandler for NoopHandler {
         &self,
         tag: &str,
         _args: &str,
-        _connection: &Connection,
+        connection: &Connection,
         _context: &SessionContext,
         _current_state: &SessionState,
-    ) -> Result<(Response, Option<SessionState>)> {
-        Ok((Response::Ok {
+    ) -> Result<Option<SessionState>> {
+        let response = Response::Ok {
             tag: Some(tag.to_string()),
             message: "NOOP completed".to_string(),
-        }, None))
+        };
+        connection.write_response(&response).await?;
+        Ok(None)
     }
 
     fn requires_auth(&self) -> bool {

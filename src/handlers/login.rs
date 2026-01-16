@@ -47,18 +47,20 @@ impl CommandHandler for LoginHandler {
         &self,
         tag: &str,
         args: &str,
-        _connection: &Connection,
+        connection: &Connection,
         context: &SessionContext,
         _current_state: &SessionState,
-    ) -> Result<(Response, Option<SessionState>)> {
+    ) -> Result<Option<SessionState>> {
         // Parse username and password
         let (username, password) = match Self::parse_args(args) {
             Some((u, p)) => (u, p),
             None => {
-                return Ok((Response::Bad {
+                let response = Response::Bad {
                     tag: Some(tag.to_string()),
                     message: "Invalid LOGIN syntax".to_string(),
-                }, None));
+                };
+                connection.write_response(&response).await?;
+                return Ok(None);
             }
         };
 
@@ -71,22 +73,31 @@ impl CommandHandler for LoginHandler {
 
         match auth_result {
             Ok(true) => {
-                // Return new authenticated state
-                Ok((Response::Ok {
+                // Write success response
+                let response = Response::Ok {
                     tag: Some(tag.to_string()),
                     message: "LOGIN completed".to_string(),
-                }, Some(SessionState::Authenticated {
-                    username
-                })))
+                };
+                connection.write_response(&response).await?;
+                // Return new authenticated state
+                Ok(Some(SessionState::Authenticated { username }))
             }
-            Ok(false) => Ok((Response::No {
-                tag: Some(tag.to_string()),
-                message: "LOGIN failed: invalid credentials".to_string(),
-            }, None)),
-            Err(e) => Ok((Response::No {
-                tag: Some(tag.to_string()),
-                message: format!("LOGIN failed: {}", e),
-            }, None)),
+            Ok(false) => {
+                let response = Response::No {
+                    tag: Some(tag.to_string()),
+                    message: "LOGIN failed: invalid credentials".to_string(),
+                };
+                connection.write_response(&response).await?;
+                Ok(None)
+            }
+            Err(e) => {
+                let response = Response::No {
+                    tag: Some(tag.to_string()),
+                    message: format!("LOGIN failed: {}", e),
+                };
+                connection.write_response(&response).await?;
+                Ok(None)
+            }
         }
     }
 

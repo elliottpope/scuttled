@@ -46,18 +46,20 @@ impl CommandHandler for ListHandler {
         &self,
         tag: &str,
         args: &str,
-        _connection: &Connection,
+        connection: &Connection,
         context: &SessionContext,
         current_state: &SessionState,
-    ) -> Result<(Response, Option<SessionState>)> {
+    ) -> Result<Option<SessionState>> {
         // Parse arguments
         let (_reference, pattern) = match Self::parse_args(args) {
             Some((r, p)) => (r, p),
             None => {
-                return Ok((Response::Bad {
+                let response = Response::Bad {
                     tag: Some(tag.to_string()),
                     message: "Invalid LIST syntax".to_string(),
-                }, None));
+                };
+                connection.write_response(&response).await?;
+                return Ok(None);
             }
         };
 
@@ -66,10 +68,12 @@ impl CommandHandler for ListHandler {
             SessionState::Authenticated { username } => username,
             SessionState::Selected { username, .. } => username,
             _ => {
-                return Ok((Response::No {
+                let response = Response::No {
                     tag: Some(tag.to_string()),
                     message: "Not authenticated".to_string(),
-                }, None));
+                };
+                connection.write_response(&response).await?;
+                return Ok(None);
             }
         };
 
@@ -95,15 +99,21 @@ impl CommandHandler for ListHandler {
                 }
                 message.push_str(&format!("{} OK LIST completed", tag));
 
-                Ok((Response::Ok {
+                let response = Response::Ok {
                     tag: Some(tag.to_string()),
                     message,
-                }, None))
+                };
+                connection.write_response(&response).await?;
+                Ok(None)
             }
-            Err(e) => Ok((Response::No {
-                tag: Some(tag.to_string()),
-                message: format!("LIST failed: {}", e),
-            }, None)),
+            Err(e) => {
+                let response = Response::No {
+                    tag: Some(tag.to_string()),
+                    message: format!("LIST failed: {}", e),
+                };
+                connection.write_response(&response).await?;
+                Ok(None)
+            }
         }
     }
 
