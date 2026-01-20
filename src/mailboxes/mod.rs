@@ -9,6 +9,23 @@ use crate::types::*;
 
 pub mod r#impl;
 
+/// Filter for listing mailboxes
+///
+/// Different filter types allow backend implementations to optimize queries.
+#[derive(Debug, Clone)]
+pub enum MailboxFilter {
+    /// Match all mailboxes
+    All,
+    /// Exact name match (case-sensitive, except INBOX which is case-insensitive)
+    Exact(String),
+    /// Prefix match (e.g., "Test*" -> prefix "Test")
+    Prefix(String),
+    /// Suffix match (e.g., "*Test" -> suffix "Test")
+    Suffix(String),
+    /// Complex pattern as a regular expression
+    Regex(String),
+}
+
 /// Mailbox information stored in the registry
 #[derive(Debug, Clone)]
 pub struct MailboxInfo {
@@ -36,8 +53,11 @@ pub trait Mailboxes: Send + Sync {
     /// Delete a mailbox
     async fn delete_mailbox(&self, username: &str, name: &str) -> Result<()>;
 
-    /// List all mailboxes for a user
-    async fn list_mailboxes(&self, username: &str) -> Result<Vec<MailboxInfo>>;
+    /// List mailboxes for a user matching the given filter
+    ///
+    /// Backend implementations can optimize based on the filter type.
+    /// For example, SQL backends can use LIKE queries for prefix/suffix patterns.
+    async fn list_mailboxes(&self, username: &str, filter: &MailboxFilter) -> Result<Vec<MailboxInfo>>;
 
     /// Update the next UID for a mailbox
     async fn update_next_uid(&self, id: &MailboxId, next_uid: Uid) -> Result<()>;

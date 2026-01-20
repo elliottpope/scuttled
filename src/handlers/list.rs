@@ -3,104 +3,69 @@
 use crate::command_handler::CommandHandler;
 use crate::connection::Connection;
 use crate::error::Result;
+use crate::mailboxes::MailboxFilter;
 use crate::protocol::Response;
 use crate::session_context::{SessionContext, SessionState};
 use async_trait::async_trait;
 
-/// Match a mailbox name against an IMAP LIST pattern
+/// Convert an IMAP LIST pattern to a MailboxFilter
 ///
-/// Supports:
-/// - `*` wildcard: matches zero or more characters at any level
-/// - `%` wildcard: matches zero or more characters at current level only (doesn't match hierarchy delimiter)
-/// - Exact matches (no wildcards)
-/// - INBOX is case-insensitive per IMAP RFC 3501
-fn matches_pattern(mailbox_name: &str, pattern: &str) -> bool {
-    // Handle wildcard-only patterns
+/// Analyzes the pattern and returns the most efficient filter type:
+/// - `*` alone -> All
+/// - No wildcards -> Exact
+/// - `prefix*` -> Prefix
+/// - `*suffix` -> Suffix
+/// - Complex patterns -> Regex
+fn pattern_to_filter(pattern: &str) -> MailboxFilter {
+    // Match all
     if pattern == "*" {
-        return true;
-    }
-    if pattern == "%" {
-        // % matches anything at the current level (no hierarchy delimiter)
-        return !mailbox_name.contains('/');
+        return MailboxFilter::All;
     }
 
-    // If no wildcards, do exact match
+    // No wildcards - exact match
     if !pattern.contains('*') && !pattern.contains('%') {
-        // INBOX is case-insensitive
-        if mailbox_name.eq_ignore_ascii_case("INBOX") && pattern.eq_ignore_ascii_case("INBOX") {
-            return true;
-        }
-        return mailbox_name == pattern;
+        return MailboxFilter::Exact(pattern.to_string());
     }
 
-    // Handle simple prefix patterns like "Test*"
+    // Simple prefix pattern: "Test*"
     if pattern.ends_with('*') && !pattern[..pattern.len()-1].contains('*') && !pattern.contains('%') {
         let prefix = &pattern[..pattern.len()-1];
-        return mailbox_name.starts_with(prefix);
+        return MailboxFilter::Prefix(prefix.to_string());
     }
 
-    // Handle simple suffix patterns like "*Test"
+    // Simple suffix pattern: "*Test"
     if pattern.starts_with('*') && !pattern[1..].contains('*') && !pattern.contains('%') {
         let suffix = &pattern[1..];
-        return mailbox_name.ends_with(suffix);
+        return MailboxFilter::Suffix(suffix.to_string());
     }
 
-    // For more complex patterns, use character-by-character matching
-    wildcard_match(mailbox_name, pattern)
+    // Complex pattern - convert to regex
+    let regex_pattern = imap_pattern_to_regex(pattern);
+    MailboxFilter::Regex(regex_pattern)
 }
 
-/// Perform wildcard matching with * and % support
-fn wildcard_match(text: &str, pattern: &str) -> bool {
-    let text_chars: Vec<char> = text.chars().collect();
-    let pattern_chars: Vec<char> = pattern.chars().collect();
+/// Convert an IMAP pattern with wildcards (* and %) to a regex pattern
+///
+/// - `*` matches zero or more characters (including /)
+/// - `%` matches zero or more characters but not /
+fn imap_pattern_to_regex(pattern: &str) -> String {
+    let mut regex = String::from("^");
 
-    wildcard_match_impl(&text_chars, &pattern_chars, 0, 0)
-}
-
-/// Recursive wildcard matching implementation
-fn wildcard_match_impl(text: &[char], pattern: &[char], t_idx: usize, p_idx: usize) -> bool {
-    // Base cases
-    if p_idx >= pattern.len() {
-        return t_idx >= text.len();
-    }
-
-    if t_idx >= text.len() {
-        // Only match if remaining pattern is all wildcards
-        return pattern[p_idx..].iter().all(|&c| c == '*');
-    }
-
-    match pattern[p_idx] {
-        '*' => {
-            // * matches zero or more characters (including /)
-            // Try matching zero characters (skip the *)
-            if wildcard_match_impl(text, pattern, t_idx, p_idx + 1) {
-                return true;
+    for ch in pattern.chars() {
+        match ch {
+            '*' => regex.push_str(".*"),
+            '%' => regex.push_str("[^/]*"),
+            // Escape regex special characters
+            '.' | '+' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                regex.push('\\');
+                regex.push(ch);
             }
-            // Try matching one or more characters
-            wildcard_match_impl(text, pattern, t_idx + 1, p_idx)
-        }
-        '%' => {
-            // % matches zero or more characters but not /
-            // Try matching zero characters (skip the %)
-            if wildcard_match_impl(text, pattern, t_idx, p_idx + 1) {
-                return true;
-            }
-            // Try matching one more character if it's not /
-            if text[t_idx] != '/' {
-                wildcard_match_impl(text, pattern, t_idx + 1, p_idx)
-            } else {
-                false
-            }
-        }
-        c => {
-            // Literal character match
-            if text[t_idx] == c {
-                wildcard_match_impl(text, pattern, t_idx + 1, p_idx + 1)
-            } else {
-                false
-            }
+            _ => regex.push(ch),
         }
     }
+
+    regex.push('$');
+    regex
 }
 
 /// Handler for the LIST command
@@ -194,17 +159,14 @@ impl CommandHandler for ListHandler {
             clean_pattern.to_string()
         };
 
-        // List mailboxes
-        match context.mailboxes.list_mailboxes(username).await {
-            Ok(mailboxes) => {
-                // Filter by pattern using wildcard matching
-                let filtered: Vec<_> = mailboxes
-                    .into_iter()
-                    .filter(|m| matches_pattern(&m.id.name, &effective_pattern))
-                    .collect();
+        // Convert the IMAP pattern to a filter
+        let filter = pattern_to_filter(&effective_pattern);
 
+        // List mailboxes using the filter (backend handles filtering)
+        match context.mailboxes.list_mailboxes(username, &filter).await {
+            Ok(mailboxes) => {
                 // Send individual untagged responses for each mailbox
-                for mailbox in &filtered {
+                for mailbox in &mailboxes {
                     let response = Response::Untagged {
                         message: format!("LIST () \"/\" \"{}\"", mailbox.id.name),
                     };
@@ -274,36 +236,59 @@ mod tests {
     }
 
     #[test]
-    fn test_matches_pattern() {
+    fn test_pattern_to_filter() {
+        // Test match all
+        match pattern_to_filter("*") {
+            MailboxFilter::All => {},
+            _ => panic!("Expected All filter for '*'"),
+        }
+
         // Test exact match
-        assert!(matches_pattern("INBOX", "INBOX"));
-        assert!(!matches_pattern("INBOX", "Drafts"));
+        match pattern_to_filter("INBOX") {
+            MailboxFilter::Exact(s) if s == "INBOX" => {},
+            _ => panic!("Expected Exact filter for 'INBOX'"),
+        }
 
-        // Test INBOX case-insensitivity
-        assert!(matches_pattern("INBOX", "inbox"));
-        assert!(matches_pattern("INBOX", "Inbox"));
-        assert!(matches_pattern("INBOX", "INBOX"));
-        assert!(matches_pattern("INBOX", "InBoX"));
+        // Test prefix match
+        match pattern_to_filter("Test*") {
+            MailboxFilter::Prefix(s) if s == "Test" => {},
+            _ => panic!("Expected Prefix filter for 'Test*'"),
+        }
 
-        // Test * wildcard
-        assert!(matches_pattern("Drafts", "*"));
-        assert!(matches_pattern("Sent", "*"));
-        assert!(matches_pattern("any/thing", "*"));
+        // Test suffix match
+        match pattern_to_filter("*Test") {
+            MailboxFilter::Suffix(s) if s == "Test" => {},
+            _ => panic!("Expected Suffix filter for '*Test'"),
+        }
 
-        // Test prefix matching
-        assert!(matches_pattern("Test1", "Test*"));
-        assert!(matches_pattern("Test2", "Test*"));
-        assert!(matches_pattern("TestABC", "Test*"));
-        assert!(!matches_pattern("Other", "Test*"));
+        // Test complex pattern (regex)
+        match pattern_to_filter("Test*Foo") {
+            MailboxFilter::Regex(_) => {},
+            _ => panic!("Expected Regex filter for 'Test*Foo'"),
+        }
 
-        // Test suffix matching
-        assert!(matches_pattern("Test", "*est"));
-        assert!(matches_pattern("BestTest", "*Test"));
-        assert!(!matches_pattern("Testing", "*Test"));
+        // Test % wildcard (regex)
+        match pattern_to_filter("Test%") {
+            MailboxFilter::Regex(_) => {},
+            _ => panic!("Expected Regex filter for 'Test%'"),
+        }
+    }
 
-        // Test % wildcard
-        assert!(matches_pattern("Test", "%"));
-        assert!(matches_pattern("Drafts", "%"));
-        assert!(!matches_pattern("Folder/Sub", "%"));
+    #[test]
+    fn test_imap_pattern_to_regex() {
+        // Test * wildcard conversion
+        assert_eq!(imap_pattern_to_regex("Test*"), r"^Test.*$");
+        assert_eq!(imap_pattern_to_regex("*Test"), r"^.*Test$");
+
+        // Test % wildcard conversion
+        assert_eq!(imap_pattern_to_regex("Test%"), r"^Test[^/]*$");
+        assert_eq!(imap_pattern_to_regex("%Test"), r"^[^/]*Test$");
+
+        // Test complex patterns
+        assert_eq!(imap_pattern_to_regex("Test*Foo%Bar"), r"^Test.*Foo[^/]*Bar$");
+
+        // Test escaping special regex characters
+        assert_eq!(imap_pattern_to_regex("Test.Foo"), r"^Test\.Foo$");
+        assert_eq!(imap_pattern_to_regex("Test+Foo"), r"^Test\+Foo$");
     }
 }

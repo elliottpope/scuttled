@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::mailboxes::{Mailboxes, MailboxInfo};
+use crate::mailboxes::{Mailboxes, MailboxFilter, MailboxInfo};
 use crate::types::*;
 
 /// Write commands for the mailbox registry (only writes go through the channel)
@@ -241,14 +241,58 @@ impl Mailboxes for InMemoryMailboxes {
             .map_err(|_| Error::Internal("Failed to receive delete response".to_string()))?
     }
 
-    async fn list_mailboxes(&self, username: &str) -> Result<Vec<MailboxInfo>> {
+    async fn list_mailboxes(&self, username: &str, filter: &MailboxFilter) -> Result<Vec<MailboxInfo>> {
         let state = self.state.read().await;
-        Ok(state
+
+        let mailboxes: Vec<MailboxInfo> = state
             .mailboxes
             .iter()
             .filter(|((u, _), _)| u == username)
             .map(|(_, info)| info.clone())
-            .collect())
+            .collect();
+
+        // Apply the filter
+        let filtered = match filter {
+            MailboxFilter::All => mailboxes,
+            MailboxFilter::Exact(pattern) => {
+                mailboxes.into_iter()
+                    .filter(|m| {
+                        // INBOX is case-insensitive per IMAP RFC 3501
+                        if m.id.name.eq_ignore_ascii_case("INBOX") && pattern.eq_ignore_ascii_case("INBOX") {
+                            true
+                        } else {
+                            m.id.name == *pattern
+                        }
+                    })
+                    .collect()
+            },
+            MailboxFilter::Prefix(prefix) => {
+                mailboxes.into_iter()
+                    .filter(|m| m.id.name.starts_with(prefix))
+                    .collect()
+            },
+            MailboxFilter::Suffix(suffix) => {
+                mailboxes.into_iter()
+                    .filter(|m| m.id.name.ends_with(suffix))
+                    .collect()
+            },
+            MailboxFilter::Regex(pattern) => {
+                // Use regex crate for pattern matching
+                match regex::Regex::new(pattern) {
+                    Ok(re) => {
+                        mailboxes.into_iter()
+                            .filter(|m| re.is_match(&m.id.name))
+                            .collect()
+                    },
+                    Err(_) => {
+                        // If regex is invalid, return empty list
+                        Vec::new()
+                    }
+                }
+            },
+        };
+
+        Ok(filtered)
     }
 
     async fn get_next_uid(&self, username: &str, mailbox: &str) -> Result<Uid> {
