@@ -309,7 +309,7 @@ async fn test_index_metadata_operations() {
     mailboxes.create_mailbox("alice", "Sent").await.unwrap();
 
     // List mailboxes
-    let boxes = mailboxes.list_mailboxes("alice").await.unwrap();
+    let boxes = mailboxes.list_mailboxes("alice", &scuttled::mailboxes::MailboxFilter::All).await.unwrap();
     assert_eq!(boxes.len(), 2);
 
     // Add message
@@ -352,7 +352,7 @@ async fn test_index_metadata_operations() {
 
     // Delete mailbox
     mailboxes.delete_mailbox("alice", "Sent").await.unwrap();
-    let mailboxes_after = mailboxes.list_mailboxes("alice").await.unwrap();
+    let mailboxes_after = mailboxes.list_mailboxes("alice", &scuttled::mailboxes::MailboxFilter::All).await.unwrap();
     assert_eq!(mailboxes_after.len(), 1);
 
     index.shutdown().await.unwrap();
