@@ -244,18 +244,22 @@ impl Mailboxes for InMemoryMailboxes {
     async fn list_mailboxes(&self, username: &str, filter: &MailboxFilter) -> Result<Vec<MailboxInfo>> {
         let state = self.state.read().await;
 
-        let mailboxes: Vec<MailboxInfo> = state
-            .mailboxes
-            .iter()
-            .filter(|((u, _), _)| u == username)
-            .map(|(_, info)| info.clone())
-            .collect();
-
-        // Apply the filter
-        let filtered = match filter {
-            MailboxFilter::All => mailboxes,
+        // Build iterator chain based on filter type, collect only once at the end
+        let filtered: Vec<MailboxInfo> = match filter {
+            MailboxFilter::All => {
+                state
+                    .mailboxes
+                    .iter()
+                    .filter(|((u, _), _)| u == username)
+                    .map(|(_, info)| info.clone())
+                    .collect()
+            },
             MailboxFilter::Exact(pattern) => {
-                mailboxes.into_iter()
+                state
+                    .mailboxes
+                    .iter()
+                    .filter(|((u, _), _)| u == username)
+                    .map(|(_, info)| info.clone())
                     .filter(|m| {
                         // INBOX is case-insensitive per IMAP RFC 3501
                         if m.id.name.eq_ignore_ascii_case("INBOX") && pattern.eq_ignore_ascii_case("INBOX") {
@@ -267,20 +271,32 @@ impl Mailboxes for InMemoryMailboxes {
                     .collect()
             },
             MailboxFilter::Prefix(prefix) => {
-                mailboxes.into_iter()
+                state
+                    .mailboxes
+                    .iter()
+                    .filter(|((u, _), _)| u == username)
+                    .map(|(_, info)| info.clone())
                     .filter(|m| m.id.name.starts_with(prefix))
                     .collect()
             },
             MailboxFilter::Suffix(suffix) => {
-                mailboxes.into_iter()
+                state
+                    .mailboxes
+                    .iter()
+                    .filter(|((u, _), _)| u == username)
+                    .map(|(_, info)| info.clone())
                     .filter(|m| m.id.name.ends_with(suffix))
                     .collect()
             },
             MailboxFilter::Regex(pattern) => {
-                // Use regex crate for pattern matching
+                // Compile regex first, then filter
                 match regex::Regex::new(pattern) {
                     Ok(re) => {
-                        mailboxes.into_iter()
+                        state
+                            .mailboxes
+                            .iter()
+                            .filter(|((u, _), _)| u == username)
+                            .map(|(_, info)| info.clone())
                             .filter(|m| re.is_match(&m.id.name))
                             .collect()
                     },
